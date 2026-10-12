@@ -1,5 +1,7 @@
 # Railflow
 
+**[▶ Play Railflow](https://claude.ai/artifact/B7MKm8wQJ6SkoCTdZYnjdi)**
+
 A minimal, top-down train network game set in India. Lay track between real Indian cities, build trains from presets, and keep passengers happy and trains on time. There is no end goal; you just keep improving your score.
 
 ## Run

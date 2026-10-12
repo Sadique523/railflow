@@ -35,6 +35,8 @@ export class Inspector {
   private sel: Selection | null = null;
   private held = false;
   private lastHtml = '';
+  /** Train whose Withdraw button has been clicked once and awaits confirmation. */
+  private armed: string | null = null;
 
   constructor(private host: InspectorHost) {
     this.panel = h('div', { class: 'panel', style: 'display:flex;flex-direction:column;min-height:0;max-height:inherit' });
@@ -45,6 +47,7 @@ export class Inspector {
 
   show(sel: Selection | null) {
     this.sel = sel;
+    this.armed = null;
     this.el.style.display = sel ? '' : 'none';
     this.lastHtml = '';
     this.refresh();
@@ -211,14 +214,20 @@ export class Inspector {
         h('div', { class: 'btnrow' },
           h('button', { class: 'btn', onclick: () => this.host.follow(following ? null : id) }, following ? 'Stop following' : 'Follow'),
           h('button', {
-            class: 'btn danger',
+            class: `btn danger${this.armed === id ? ' armed' : ''}`,
             onclick: () => {
-              if (confirm(`Withdraw ${t.cfg.number}? You get 40% of its price back.`)) {
-                g.removeTrain(id);
-                this.host.select(null);
+              // two clicks: the first arms the button, the second withdraws
+              if (this.armed !== id) {
+                this.armed = id;
+                this.lastHtml = '';
+                this.refresh();
+                return;
               }
+              this.armed = null;
+              g.removeTrain(id);
+              this.host.select(null);
             },
-          }, 'Withdraw'),
+          }, this.armed === id ? `Confirm · ${fmt.cr(g.trainPrice(t.type, t.cfg.coaches) * 0.4)} back` : 'Withdraw'),
         ),
       ),
     ];

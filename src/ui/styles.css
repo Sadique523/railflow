@@ -393,3 +393,4 @@ body.panel-open .guide { display: none; }
 .path:disabled { opacity: .45; cursor: not-allowed; }
 .tip .terrain { color: #ffd97a; }
 @media (max-width: 900px) { .eras { grid-template-columns: 1fr; } }
+.btn.danger.armed { background: var(--red); color: #fff; }
