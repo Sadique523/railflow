@@ -2,6 +2,24 @@
 // then track fit for higher speeds, safety systems before going past 130 km/h, home-grown
 // semi high-speed trainsets, and finally dedicated high-speed lines.
 
+/**
+ * Some technology can be bought in or built up at home. Importing is quick, but every train
+ * built under licence costs more; developing it in India is slower and cheaper, and may give
+ * a less ambitious design.
+ */
+export interface ResearchPath {
+  label: string;
+  cost: number;
+  hours: number;
+  /** Price multiplier on the train types this project unlocks. */
+  trainCostMult: number;
+  /** Top-speed multiplier on those train types. */
+  speedMult?: number;
+  note: string;
+}
+
+export type PathChoice = 'import' | 'home';
+
 export interface ResearchProject {
   id: string;
   name: string;
@@ -10,6 +28,7 @@ export interface ResearchProject {
   hours: number; // game hours to complete
   requires: string[];
   unlocks: string;
+  paths?: Record<PathChoice, ResearchPath>;
 }
 
 export const RESEARCH: ResearchProject[] = [
@@ -17,6 +36,10 @@ export const RESEARCH: ResearchProject[] = [
     id: 'lhb', name: 'LHB coaches', cost: 40, hours: 18, requires: [],
     blurb: 'Lighter, safer German-designed coaches built in India. The basis for faster premium trains.',
     unlocks: 'Shatabdi and Rajdhani Express',
+    paths: {
+      import: { label: 'Import from Germany', cost: 45, hours: 10, trainCostMult: 1.3, note: 'Coaches built under licence cost 30% more' },
+      home: { label: 'Indigenise at RCF Kapurthala', cost: 35, hours: 30, trainCostMult: 1, note: 'Slower, but coaches at home prices' },
+    },
   },
   {
     id: 'track130', name: '130 km/h track', cost: 60, hours: 24, requires: ['lhb'],
@@ -42,11 +65,19 @@ export const RESEARCH: ResearchProject[] = [
     id: 'hsr', name: 'High-speed rail', cost: 400, hours: 72, requires: ['track160', 'vande'],
     blurb: 'Dedicated standard-gauge high-speed lines on viaducts. Hugely expensive and slow to build.',
     unlocks: 'High-speed lines (300 km/h) and the bullet train',
+    paths: {
+      import: { label: 'Import Shinkansen technology', cost: 420, hours: 48, trainCostMult: 1.5, note: '300 km/h trains, but each costs 50% more' },
+      home: { label: 'Develop with BEML', cost: 300, hours: 110, trainCostMult: 1, speedMult: 280 / 300, note: 'Much slower; home-built trains top out at 280 km/h' },
+    },
   },
   {
     id: 'wag12', name: 'WAG-12 locomotives', cost: 80, hours: 24, requires: [],
     blurb: '12,000 hp twin-section electric locomotives for heavier, faster bulk trains.',
     unlocks: 'Heavy haul freight trains',
+    paths: {
+      import: { label: 'Joint venture with a European maker', cost: 90, hours: 14, trainCostMult: 1.25, note: 'Locomotives cost 25% more' },
+      home: { label: 'Develop at Chittaranjan', cost: 65, hours: 40, trainCostMult: 1, note: 'Slower, at home prices' },
+    },
   },
   {
     id: 'dfc', name: 'Dedicated freight corridors', cost: 140, hours: 48, requires: [],

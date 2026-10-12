@@ -56,6 +56,16 @@ export interface River {
   line: XZ[];
 }
 
+const RIVER_NAMES: Record<string, string> = {
+  Ganges: 'Ganga', 'Godävari': 'Godavari', 'Mahäna Nadï': 'Mahanadi', Dihang: 'Brahmaputra', Yarlung: 'Brahmaputra',
+  Ayeyarwady: 'Irrawaddy', 'Irrawaddy Delta': 'Irrawaddy',
+};
+
+/** Everyday name for a river in the Natural Earth data. */
+export function riverName(n: string): string {
+  return RIVER_NAMES[n] ?? n;
+}
+
 export const RIVERS: River[] = (mapdata.rivers as { name: string; rank: number; line: number[] }[])
   .map((r) => ({ name: r.name, rank: r.rank, line: ringXZ(r.line) }));
 

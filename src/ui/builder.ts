@@ -1,5 +1,5 @@
 import { CITIES, city } from '../data/cities';
-import { PAX_CLASSES, PAX_CLASS_INFO, TRAIN_TYPES, TRAIN_TYPE_BY_ID, TrainType, isFreight, trainCapacity, trainCost, trainSeats } from '../data/trainTypes';
+import { PAX_CLASSES, PAX_CLASS_INFO, TRAIN_TYPES, TRAIN_TYPE_BY_ID, TrainType, isFreight, trainCapacity, trainSeats } from '../data/trainTypes';
 import { COMMODITY_INFO } from '../data/freight';
 import { RESEARCH_BY_ID } from '../data/research';
 import { km } from '../sim/network';
@@ -112,7 +112,7 @@ export class TrainBuilder {
       },
       h('span', { class: 'stripe', style: `background:${t.accent}` }),
       h('span', { class: 'nm' }, t.name),
-      h('span', { class: 'price' }, locked ? `🔒 ${RESEARCH_BY_ID.get(t.research!)!.name}` : fmt.cr(trainCost(t, t.defaultCoaches))),
+      h('span', { class: 'price' }, locked ? `🔒 ${RESEARCH_BY_ID.get(t.research!)!.name}` : fmt.cr(g.trainPrice(t, t.defaultCoaches))),
       h('span', { class: 'meta' }, `${t.cruiseKmh} km/h · `, classTags(t)),
       );
     };
@@ -196,11 +196,13 @@ export class TrainBuilder {
     const g = this.host.game;
     const t = this.type;
     const info = g.routeInfo(this.stops, t.id);
-    const cost = trainCost(t, this.coaches);
+    const cost = g.trainPrice(t, this.coaches);
+    const licence = g.techTerms(t).costMult;
     const rows: (string | HTMLElement)[] = [];
     let slowLine = 0;
     if (info.ok) {
       const probe = new Train({ id: 'probe', number: '', name: '', typeId: t.id, coaches: this.coaches, stops: this.stops });
+      probe.speedMult = g.techTerms(t).speedMult;
       probe.buildPath(g.net);
       for (let i = 1; i < probe.path.length; i++) {
         const e = g.net.edge(probe.path[i - 1], probe.path[i])!;
@@ -218,7 +220,7 @@ export class TrainBuilder {
         ? [h('span', null, 'Capacity'), h('span', null, `${fmt.int(trainCapacity(t, this.coaches))} t`)]
         : [h('span', null, 'Seats / max load'), h('span', null, `${fmt.int(trainSeats(t, this.coaches))} / ${fmt.int(trainCapacity(t, this.coaches))}`)]),
       h('span', null, 'Running cost'), h('span', null, `${fmt.cr(opDay)} / day`),
-      h('span', null, 'Purchase'), h('span', { class: cost > g.funds ? 'neg' : '' }, fmt.cr(cost)),
+      h('span', null, 'Purchase'), h('span', { class: cost > g.funds ? 'neg' : '' }, `${fmt.cr(cost)}${licence > 1 ? ` (licence +${Math.round((licence - 1) * 100)}%)` : ''}`),
     );
     const reason = !info.ok ? info.reason : cost > g.funds ? 'Not enough funds' : '';
     const btn = h('button', {

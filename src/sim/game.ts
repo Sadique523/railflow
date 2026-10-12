@@ -1,8 +1,11 @@
 import { CITIES, city } from '../data/cities';
 import { PAX_CLASSES, PAX_CLASS_INFO, PaxClass, TRAIN_TYPE_BY_ID, trainCost } from '../data/trainTypes';
 import {
-  DFC, DOUBLING_KM_PER_DAY, RESEARCH_BY_ID, lineClass, nextLineClass,
+  DFC, DOUBLING_KM_PER_DAY, LINE_CLASSES, PathChoice, RESEARCH_BY_ID, ResearchProject, lineClass, nextLineClass,
 } from '../data/research';
+import { TrainType } from '../data/trainTypes';
+import { TerrainProfile, bridgeCost, terrainProfile } from '../data/terrain';
+import { LINES_1951, START_FUNDS_1951 } from '../data/era1951';
 import { COMMODITIES, COMMODITY_INFO, Commodity, flowWeight } from '../data/freight';
 import {
   MAX_TRACK_KM, Network, TrackEdge, distance, doubleCost, edgeId, km, liveTracks, routeMode, trackCost,
@@ -11,6 +14,13 @@ import { CargoGroup, ON_TIME_MIN, PaxGroup, Segment, Train, TrainConfig } from '
 import { Flow, Ledger } from './ledger';
 
 export const START_FUNDS = 600;
+/** New track: km laid per game day on easy ground. */
+const BUILD_KM_PER_DAY = 400;
+/** Project Unigauge: converting metre gauge to broad gauge. */
+const GAUGE_COST_PER_KM = 0.12;
+const GAUGE_KM_PER_DAY = 150;
+
+export type Era = 'modern' | '1951';
 const FARE_PER_PAX_KM = 0.00003; // ₹ Cr
 const DEMAND_PER_HOUR = 9; // passengers/hour per sqrt(M·M) of population, all classes, before service quality
 /** How strongly each class responds to service speed (door-to-door km/h). */
@@ -93,7 +103,18 @@ interface ServedPair {
 
 export interface ResearchState {
   done: Set<string>;
-  active: { id: string; start: number; end: number } | null;
+  active: { id: string; start: number; end: number; path?: PathChoice } | null;
+  /** Projects done by importing or by developing at home. */
+  paths: Record<string, PathChoice>;
+}
+
+/** What a new line will cost and take, and why. */
+export interface BuildCheck {
+  ok: boolean;
+  cost: number;
+  hours: number;
+  terrain: TerrainProfile;
+  reason?: string;
 }
 
 export interface Stats {
@@ -124,7 +145,8 @@ export class Game {
   private hW = 40;
   private recentArrivals: boolean[] = [];
   private servedPairs: ServedPair[] = [];
-  research: ResearchState = { done: new Set(), active: null };
+  research: ResearchState = { done: new Set(), active: null, paths: {} };
+  era: Era = 'modern';
   /** Freight flows some train can carry: commodity from o to d, and how many trains offer it. */
   private freightFlows: { o: string; d: string; c: Commodity; trains: number }[] = [];
   /** Train-minutes spent held at signals this step, by line, for the congestion view. */
@@ -137,9 +159,16 @@ export class Game {
   /** Bumped whenever tracks or trains change, so renderers can resync. */
   version = 0;
 
-  constructor() {
+  constructor(era: Era = 'modern') {
     for (const c of CITIES) {
       this.stations.set(c.id, { id: c.id, waiting: [], cargo: [], acc: new Map(), demandMult: 1 });
+    }
+    if (era === '1951') {
+      // inherit the railways of 1951: tracks already laid, a mix of broad and metre gauge
+      this.era = era;
+      this.funds = START_FUNDS_1951;
+      for (const [a, b, gauge] of LINES_1951) this.net.addEdge(a, b, 1, 110, false, gauge);
+      this.notify('1951: the zonal railways are formed. Broad and metre gauge do not mix; convert lines to run through.');
     }
   }
 
@@ -191,22 +220,30 @@ export class Game {
 
   // ---------------------------------------------------------------- building
 
-  canBuildTrack(a: string, b: string): { ok: boolean; cost: number; reason?: string } {
-    const cost = trackCost(a, b);
-    if (a === b) return { ok: false, cost, reason: 'Pick a different city' };
-    if (this.net.edges.has(edgeId(a, b))) return { ok: false, cost, reason: 'Already connected' };
-    if (km(distance(a, b)) > MAX_TRACK_KM) return { ok: false, cost, reason: `Too long (max ${MAX_TRACK_KM} km)` };
-    if (cost > this.funds) return { ok: false, cost, reason: 'Not enough funds' };
-    return { ok: true, cost };
+  /** Cost and time of a new line: hard ground multiplies both, and every big river needs a bridge. */
+  canBuildTrack(a: string, b: string): BuildCheck {
+    const terrain = terrainProfile(city(a), city(b));
+    const bridges = terrain.bridges.map(bridgeCost);
+    const cost = trackCost(a, b) * terrain.costMult + bridges.reduce((s, x) => s + x.cost, 0);
+    const hours = Math.max(4, (km(distance(a, b)) / BUILD_KM_PER_DAY) * 24 * terrain.timeMult + bridges.reduce((s, x) => s + x.hours, 0));
+    const res = { cost, hours, terrain };
+    if (a === b) return { ok: false, ...res, reason: 'Pick a different city' };
+    if (this.net.edges.has(edgeId(a, b))) return { ok: false, ...res, reason: 'Already connected' };
+    if (km(distance(a, b)) > MAX_TRACK_KM) return { ok: false, ...res, reason: `Too long (max ${MAX_TRACK_KM} km)` };
+    if (cost > this.funds) return { ok: false, ...res, reason: 'Not enough funds' };
+    return { ok: true, ...res };
   }
 
   buildTrack(a: string, b: string): boolean {
     const chk = this.canBuildTrack(a, b);
     if (!chk.ok) return false;
     this.book('track', -chk.cost);
-    this.net.addEdge(a, b);
+    const e = this.net.addEdge(a, b);
+    e.works = { kind: 'build', start: this.time, end: this.time + chk.hours * 60 };
     this.version++;
-    this.notify(`Track laid: ${city(a).name} – ${city(b).name} (${Math.round(km(distance(a, b)))} km)`);
+    const hard = chk.terrain.label ? ` through the ${chk.terrain.label.toLowerCase()}` : '';
+    const br = chk.terrain.bridges.length ? `, ${chk.terrain.bridges.length} bridge${chk.terrain.bridges.length > 1 ? 's' : ''}` : '';
+    this.notify(`Construction begins: ${city(a).name} – ${city(b).name} (${Math.round(km(distance(a, b)))} km${hard}${br}), open ${fmtWhen(e.works.end)}`);
     return true;
   }
 
@@ -247,30 +284,52 @@ export class Game {
     return !id || this.research.done.has(id);
   }
 
-  canResearch(id: string): { ok: boolean; reason?: string } {
+  /** Cost and time of a project, by the chosen path where it has one. */
+  static projectTerms(r: ResearchProject, path?: PathChoice): { cost: number; hours: number } {
+    const p = path && r.paths?.[path];
+    return p ? { cost: p.cost, hours: p.hours } : { cost: r.cost, hours: r.hours };
+  }
+
+  canResearch(id: string, path?: PathChoice): { ok: boolean; reason?: string } {
     const r = RESEARCH_BY_ID.get(id);
     if (!r) return { ok: false, reason: 'Unknown project' };
     if (this.research.done.has(id)) return { ok: false, reason: 'Done' };
     if (this.research.active) return { ok: false, reason: 'Another project is running' };
     const missing = r.requires.filter((q) => !this.research.done.has(q));
     if (missing.length) return { ok: false, reason: `Needs ${missing.map((q) => RESEARCH_BY_ID.get(q)!.name).join(' and ')}` };
-    if (r.cost > this.funds) return { ok: false, reason: 'Not enough funds' };
+    if (r.paths && !path) return { ok: false, reason: 'Choose import or develop at home' };
+    if (Game.projectTerms(r, path).cost > this.funds) return { ok: false, reason: 'Not enough funds' };
     return { ok: true };
   }
 
-  startResearch(id: string): boolean {
-    if (!this.canResearch(id).ok) return false;
+  startResearch(id: string, path?: PathChoice): boolean {
+    if (!this.canResearch(id, path).ok) return false;
     const r = RESEARCH_BY_ID.get(id)!;
-    this.book('research', -r.cost);
-    this.research.active = { id, start: this.time, end: this.time + r.hours * 60 };
-    this.notify(`Research started: ${r.name}, ready ${fmtWhen(this.research.active.end)}`);
+    const terms = Game.projectTerms(r, path);
+    this.book('research', -terms.cost);
+    this.research.active = { id, start: this.time, end: this.time + terms.hours * 60, path };
+    const how = path && r.paths ? ` (${r.paths[path].label.toLowerCase()})` : '';
+    this.notify(`Research started: ${r.name}${how}, ready ${fmtWhen(this.research.active.end)}`);
     return true;
+  }
+
+  /** Price multiplier and speed multiplier for a train type, from how its technology was obtained. */
+  techTerms(type: TrainType): { costMult: number; speedMult: number } {
+    const r = type.research ? RESEARCH_BY_ID.get(type.research) : undefined;
+    const path = r && this.research.paths[r.id];
+    const p = path && r!.paths?.[path];
+    return { costMult: p?.trainCostMult ?? 1, speedMult: p?.speedMult ?? 1 };
+  }
+
+  trainPrice(type: TrainType, coaches: number): number {
+    return trainCost(type, coaches) * this.techTerms(type).costMult;
   }
 
   private updateResearch() {
     const a = this.research.active;
     if (!a || this.time < a.end) return;
     this.research.done.add(a.id);
+    if (a.path) this.research.paths[a.id] = a.path;
     this.research.active = null;
     const r = RESEARCH_BY_ID.get(a.id)!;
     this.notify(`Research complete: ${r.name}. Unlocked ${r.unlocks}.`, 'good');
@@ -283,12 +342,21 @@ export class Game {
   upgradeInfo(id: string): { ok: boolean; toKmh?: number; cost?: number; hours?: number; reason?: string } {
     const e = this.net.edges.get(id);
     if (!e) return { ok: false, reason: 'No such line' };
-    const next = nextLineClass(e.kmh);
+    // ghat and mountain lines cannot be made faster on their old alignment; only a high-speed
+    // line, tunnelling straight through, beats the terrain
+    const capped = !!e.terrain.kmhCap && e.kmh < 300;
+    const next = capped ? LINE_CLASSES[LINE_CLASSES.length - 1] : nextLineClass(e.kmh);
     if (!next) return { ok: false, reason: 'Already at top speed' };
-    const cost = km(e.length) * next.costPerKm * (e.tracks === 2 ? 1.7 : 1);
-    const hours = Math.max(6, (km(e.length) / next.kmPerDay) * 24);
+    const hsr = next.kmh >= 300;
+    // high-speed lines are a new alignment on viaducts and tunnels: terrain hits cost, not speed
+    const cost = km(e.length) * next.costPerKm * (hsr ? 1 : e.tracks === 2 ? 1.7 : 1) * e.terrain.costMult;
+    const hours = Math.max(6, (km(e.length) / next.kmPerDay) * 24 * e.terrain.timeMult);
     const base = { toKmh: next.kmh, cost, hours };
-    if (!this.isResearched(next.research)) return { ok: false, ...base, reason: `Research ${RESEARCH_BY_ID.get(next.research!)!.name}` };
+    if (e.gauge === 'mg') return { ok: false, ...base, reason: 'Convert to broad gauge first' };
+    if (!this.isResearched(next.research)) {
+      const why = capped ? `${e.terrain.label} limits it to ${e.terrain.kmhCap} km/h; only a high-speed line can tunnel through. ` : '';
+      return { ok: false, ...base, reason: `${why}Research ${RESEARCH_BY_ID.get(next.research!)!.name}` };
+    }
     if (e.works) return { ok: false, ...base, reason: 'Works already under way' };
     if (cost > this.funds) return { ok: false, ...base, reason: 'Not enough funds' };
     return { ok: true, ...base };
@@ -299,6 +367,19 @@ export class Game {
     if (!info.ok) return false;
     const e = this.net.edges.get(id)!;
     this.book('track', -info.cost!);
+    if (info.toKmh! >= 300) {
+      // land first: how long it takes and what it finally costs is only known as it goes
+      const landHours = info.hours! * (0.4 + Math.random() * 1.1);
+      const overrun = Math.pow(Math.random(), 1.4) * 0.9;
+      const landEnd = this.time + landHours * 60;
+      e.works = {
+        kind: 'upgrade', toKmh: info.toKmh, start: this.time, end: landEnd + info.hours! * 60,
+        landEnd, landCost: info.cost! * overrun, landPaid: false,
+      };
+      this.version++;
+      this.notify(`High-speed line: ${city(e.a).name} – ${city(e.b).name} enters land acquisition. Timing and final cost are uncertain.`);
+      return true;
+    }
     e.works = { kind: 'upgrade', toKmh: info.toKmh, start: this.time, end: this.time + info.hours! * 60 };
     this.version++;
     this.notify(`Works begin: ${city(e.a).name} – ${city(e.b).name} to ${info.toKmh} km/h. ${this.worksImpact(e)}`, 'bad');
@@ -309,8 +390,8 @@ export class Game {
     const e = this.net.edges.get(id);
     if (!e) return { ok: false, reason: 'No such line' };
     if (e.tracks === 2) return { ok: false, reason: 'Already double' };
-    const cost = doubleCost(e) * (lineClass(e.kmh).costPerKm > 0 ? 1.3 : 1);
-    const hours = Math.max(6, (km(e.length) / DOUBLING_KM_PER_DAY) * 24);
+    const cost = doubleCost(e) * (lineClass(e.kmh).costPerKm > 0 ? 1.3 : 1) * e.terrain.costMult;
+    const hours = Math.max(6, (km(e.length) / DOUBLING_KM_PER_DAY) * 24 * e.terrain.timeMult);
     if (e.works) return { ok: false, cost, hours, reason: 'Works already under way' };
     if (cost > this.funds) return { ok: false, cost, hours, reason: 'Not enough funds' };
     return { ok: true, cost, hours };
@@ -321,8 +402,9 @@ export class Game {
     const e = this.net.edges.get(id);
     if (!e) return { ok: false, reason: 'No such line' };
     if (e.dfc) return { ok: false, reason: 'Corridor built' };
-    const cost = km(e.length) * DFC.costPerKm;
-    const hours = Math.max(8, (km(e.length) / DFC.kmPerDay) * 24);
+    if (e.gauge === 'mg') return { ok: false, reason: 'Convert to broad gauge first' };
+    const cost = km(e.length) * DFC.costPerKm * e.terrain.costMult;
+    const hours = Math.max(8, (km(e.length) / DFC.kmPerDay) * 24 * e.terrain.timeMult);
     if (!this.research.done.has('dfc')) return { ok: false, cost, hours, reason: 'Research Dedicated freight corridors' };
     if (e.works) return { ok: false, cost, hours, reason: 'Works already under way' };
     if (cost > this.funds) return { ok: false, cost, hours, reason: 'Not enough funds' };
@@ -337,6 +419,30 @@ export class Game {
     e.works = { kind: 'dfc', start: this.time, end: this.time + info.hours! * 60 };
     this.version++;
     this.notify(`Freight corridor under construction: ${city(e.a).name} – ${city(e.b).name}. Built alongside, so traffic keeps moving.`);
+    return true;
+  }
+
+  /** Converting a metre gauge line to broad gauge: the line closes while it is relaid. */
+  gaugeInfo(id: string): { ok: boolean; cost?: number; hours?: number; reason?: string } {
+    const e = this.net.edges.get(id);
+    if (!e) return { ok: false, reason: 'No such line' };
+    if (e.gauge === 'bg') return { ok: false, reason: 'Already broad gauge' };
+    const cost = km(e.length) * GAUGE_COST_PER_KM * e.terrain.costMult * (e.tracks === 2 ? 1.6 : 1);
+    const hours = Math.max(8, (km(e.length) / GAUGE_KM_PER_DAY) * 24 * e.terrain.timeMult);
+    if (e.works) return { ok: false, cost, hours, reason: 'Works already under way' };
+    if (cost > this.funds) return { ok: false, cost, hours, reason: 'Not enough funds' };
+    return { ok: true, cost, hours };
+  }
+
+  convertGauge(id: string): boolean {
+    const info = this.gaugeInfo(id);
+    if (!info.ok) return false;
+    const e = this.net.edges.get(id)!;
+    const users = this.trainsUsingEdge(id).length;
+    this.book('track', -info.cost!);
+    e.works = { kind: 'gauge', start: this.time, end: this.time + info.hours! * 60 };
+    this.version++;
+    this.notify(`Gauge conversion: ${city(e.a).name} – ${city(e.b).name} closed until ${fmtWhen(e.works.end)}.${users ? ` ${users} train${users > 1 ? 's' : ''} will have to wait or be withdrawn.` : ''}`, 'bad');
     return true;
   }
 
@@ -367,14 +473,27 @@ export class Game {
   private updateWorks() {
     for (const e of this.net.edges.values()) {
       const w = e.works;
-      if (!w || this.time < w.end) continue;
+      if (!w) continue;
+      if (w.landEnd && !w.landPaid && this.time >= w.landEnd) {
+        w.landPaid = true;
+        const extra = w.landCost ?? 0;
+        if (extra > 0.5) {
+          this.book('track', -extra);
+          this.notify(`Land acquired for ${city(e.a).name} – ${city(e.b).name}, ₹${Math.round(extra)} Cr over budget. Viaduct construction begins.`, 'bad');
+        } else this.notify(`Land acquired for ${city(e.a).name} – ${city(e.b).name} on budget. Viaduct construction begins.`, 'good');
+      }
+      if (this.time < w.end) continue;
       if (w.kind === 'upgrade') e.kmh = w.toKmh!;
       else if (w.kind === 'dfc') e.dfc = true;
-      else e.tracks = 2;
+      else if (w.kind === 'gauge') e.gauge = 'bg';
+      else if (w.kind === 'double') e.tracks = 2;
       e.works = null;
       this.version++;
-      const what = w.kind === 'upgrade' ? `now ${e.kmh} km/h` : w.kind === 'dfc' ? 'freight corridor open' : 'now double track';
-      this.notify(`Works complete: ${city(e.a).name} – ${city(e.b).name} ${what}`, 'good');
+      const what = {
+        build: 'open for traffic', upgrade: `now ${e.kmh} km/h`, dfc: 'freight corridor open',
+        gauge: 'reopened as broad gauge', double: 'now double track',
+      }[w.kind];
+      this.notify(`${w.kind === 'build' ? 'Line' : 'Works'} complete: ${city(e.a).name} – ${city(e.b).name} ${what}`, 'good');
     }
   }
 
@@ -386,8 +505,11 @@ export class Game {
     const type = typeId ? TRAIN_TYPE_BY_ID.get(typeId) : undefined;
     const path = this.net.routePath(stops, type ? routeMode(type) : {});
     if (!path) {
+      const mode = type ? routeMode(type) : {};
       if (type?.needsLineKmh) return { ok: false, reason: `Needs ${type.needsLineKmh} km/h high-speed line between every stop` };
       if (type?.needsDfc) return { ok: false, reason: 'Needs a freight corridor between every stop' };
+      if (this.net.routePath(stops, { ...mode, includeClosed: true })) return { ok: false, reason: 'Track still being built or closed for conversion' };
+      if (this.net.routePath(stops, { ...mode, anyGauge: true })) return { ok: false, reason: 'Break of gauge: these stops are on broad and metre gauge' };
       return { ok: false, reason: 'Stops are not connected by track' };
     }
     return { ok: true, path, length: this.net.pathLength(path) };
@@ -405,7 +527,7 @@ export class Game {
     if (!this.isResearched(type.research)) return `Research ${RESEARCH_BY_ID.get(type.research!)!.name} first`;
     const route = this.routeInfo(spec.stops, spec.typeId);
     if (!route.ok) return route.reason!;
-    const cost = trainCost(type, spec.coaches);
+    const cost = this.trainPrice(type, spec.coaches);
     if (cost > this.funds) return 'Not enough funds';
     const cfg: TrainConfig = {
       ...spec,
@@ -414,6 +536,7 @@ export class Game {
     };
     this.nextTrainNum++;
     const t = new Train(cfg);
+    t.speedMult = this.techTerms(type).speedMult;
     t.money = new Ledger(this.time);
     // first departure on the next quarter hour; trains added to an identical route are
     // spread through its cycle (½, ¼, ¾ …) so they do not run in a bunch
@@ -437,7 +560,7 @@ export class Game {
       e.occupants.delete(id);
       e.dfcOccupants.delete(id);
     }
-    this.book('sales', trainCost(t.type, t.cfg.coaches) * 0.4);
+    this.book('sales', this.trainPrice(t.type, t.cfg.coaches) * 0.4);
     this.trains.delete(id);
     this.refreshServedPairs();
     this.version++;
@@ -953,8 +1076,9 @@ export class Game {
       hW: this.hW,
       recent: this.recentArrivals,
       nextTrainNum: this.nextTrainNum,
-      edges: [...this.net.edges.values()].map((e) => [e.a, e.b, e.tracks, e.kmh, e.works, e.dfc]),
-      research: { done: [...this.research.done], active: this.research.active },
+      era: this.era,
+      edges: [...this.net.edges.values()].map((e) => [e.a, e.b, e.tracks, e.kmh, e.works, e.dfc, e.gauge]),
+      research: { done: [...this.research.done], active: this.research.active, paths: this.research.paths },
       trains: [...this.trains.values()].map((t) => t.cfg),
       ledger: this.ledger.toJSON(),
       trainMoney: Object.fromEntries([...this.trains.values()].map((t) => [t.cfg.id, { ledger: t.money.toJSON(), lastTrip: t.lastTripFares }])),
@@ -989,13 +1113,15 @@ export class Game {
       g.lastHour = Math.floor(g.time / 60);
       g.nextEventAt = g.time + 12 * 60;
       g.ledger = Ledger.from(d.ledger, g.time);
-      for (const [a, b, tracks, kmh, works, dfc] of d.edges) g.net.addEdge(a, b, tracks, kmh ?? 110, !!dfc).works = works ?? null;
-      g.research = { done: new Set(d.research?.done ?? []), active: d.research?.active ?? null };
+      g.era = d.era ?? 'modern';
+      for (const [a, b, tracks, kmh, works, dfc, gauge] of d.edges) g.net.addEdge(a, b, tracks, kmh ?? 110, !!dfc, gauge ?? 'bg').works = works ?? null;
+      g.research = { done: new Set(d.research?.done ?? []), active: d.research?.active ?? null, paths: d.research?.paths ?? {} };
       for (const cfg of d.trains as TrainConfig[]) {
         const t = new Train(cfg);
         const money = d.trainMoney?.[cfg.id];
         t.money = Ledger.from(money?.ledger, g.time);
         t.lastTripFares = money?.lastTrip ?? null;
+        t.speedMult = g.techTerms(t.type).speedMult;
         if (t.start(g.net, g.time, Math.ceil((g.time + 5) / 15) * 15)) g.trains.set(cfg.id, t);
       }
       g.refreshServedPairs();

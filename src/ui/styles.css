@@ -378,3 +378,18 @@ body.panel-open .guide { display: none; }
 .types .group:first-child { margin-top: 0; }
 .legend i.frt { background: var(--freight); }
 .cash-pop.freight span { background: var(--freight); }
+
+/* ---------- eras, research paths, terrain ---------- */
+.eras { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+.era { border: 0; background: #fff; text-align: left; padding: 14px; display: flex; flex-direction: column; gap: 6px; outline: 2px solid transparent; }
+.era b { font-size: 22px; letter-spacing: .06em; }
+.era span { font-size: 13px; color: var(--ink-2); line-height: 1.45; }
+.era:hover { outline-color: var(--ink); }
+.paths { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 4px; }
+.path { border: 1px solid var(--ink); background: #fff; text-align: left; padding: 7px 8px; display: flex; flex-direction: column; gap: 2px; font-size: 11px; }
+.path b { font-size: 12px; }
+.path em { font-style: normal; color: var(--ink-3); line-height: 1.3; }
+.path:hover:not(:disabled) { background: var(--blue-soft); }
+.path:disabled { opacity: .45; cursor: not-allowed; }
+.tip .terrain { color: #ffd97a; }
+@media (max-width: 900px) { .eras { grid-template-columns: 1fr; } }

@@ -2,13 +2,25 @@ import { city } from '../data/cities';
 import { KM_PER_UNIT } from '../data/geo';
 import { DFC, WORKS_SPEED } from '../data/research';
 import { TrainType, isFreight } from '../data/trainTypes';
+import { TerrainProfile, terrainProfile } from '../data/terrain';
 
-/** Engineering works on a line: an upgrade to a faster class, doubling, or a freight corridor alongside. */
+export type Gauge = 'bg' | 'mg';
+/** Metre gauge lines are light, curvy and slow. */
+export const MG_KMH = 75;
+
+/**
+ * Engineering works on a line: building it, an upgrade to a faster class, doubling, a freight
+ * corridor alongside, or converting metre gauge to broad gauge.
+ */
 export interface Works {
-  kind: 'upgrade' | 'double' | 'dfc';
+  kind: 'build' | 'upgrade' | 'double' | 'dfc' | 'gauge';
   toKmh?: number; // upgrade target
   start: number; // game minutes
   end: number;
+  /** High-speed lines: land is bought first, and its final bill is only known when that is done. */
+  landEnd?: number;
+  landCost?: number; // the extra to pay when land acquisition finishes
+  landPaid?: boolean;
 }
 
 export interface TrackEdge {
@@ -22,6 +34,9 @@ export interface TrackEdge {
   works: Works | null;
   /** A dedicated freight corridor (double track) runs alongside. */
   dfc: boolean;
+  gauge: Gauge;
+  /** What the line runs through: hard ground caps its speed below high-speed class. */
+  terrain: TerrainProfile;
   /** Number of signal blocks; crossing loops sit between them. */
   blocks: number;
   /** Runtime: trains whose head is on this edge: travel direction (+1 = a→b) and block. */
@@ -69,14 +84,31 @@ export function liveTracks(e: TrackEdge): 1 | 2 {
   return e.works?.kind === 'upgrade' ? 1 : e.tracks;
 }
 
-/** Works on the line itself slow it; a corridor is built alongside without disturbing traffic. */
+/**
+ * Works on the line itself slow it. Freight corridors and high-speed lines go up alongside on
+ * their own alignment, so traffic is undisturbed.
+ */
 export function slowedByWorks(e: TrackEdge): boolean {
-  return e.works?.kind === 'upgrade' || e.works?.kind === 'double';
+  return (e.works?.kind === 'upgrade' && (e.works.toKmh ?? 0) < 300) || e.works?.kind === 'double';
+}
+
+/** Lines being built, or closed for gauge conversion, carry no trains. */
+export function isOpen(e: TrackEdge): boolean {
+  return e.works?.kind !== 'build' && e.works?.kind !== 'gauge';
+}
+
+/** The fastest the line allows, before works and events: its class, held back by gauge and terrain. */
+export function lineTopKmh(e: TrackEdge): number {
+  if (e.kmh >= 300) return e.kmh; // high-speed lines tunnel through
+  let v = e.kmh;
+  if (e.gauge === 'mg') v = Math.min(v, MG_KMH);
+  if (e.terrain.kmhCap) v = Math.min(v, e.terrain.kmhCap);
+  return v;
 }
 
 /** Line speed limit in km/h, allowing for works (events are applied separately). */
 export function lineKmh(e: TrackEdge): number {
-  return e.kmh * (slowedByWorks(e) ? WORKS_SPEED : 1);
+  return lineTopKmh(e) * (slowedByWorks(e) ? WORKS_SPEED : 1);
 }
 
 /** How a train type searches for routes. */
@@ -84,6 +116,9 @@ export interface RouteMode {
   minKmh?: number; // high-speed trains: only lines at least this fast
   freight?: boolean; // freight uses corridors where there are any
   needsDfc?: boolean; // only lines with a corridor
+  gauge?: Gauge; // stay on one gauge (routePath tries broad, then metre)
+  anyGauge?: boolean; // diagnostics: ignore breaks of gauge
+  includeClosed?: boolean; // diagnostics: include lines being built or converted
 }
 
 export function routeMode(t: TrainType): RouteMode {
@@ -99,13 +134,14 @@ export class Network {
   edges = new Map<string, TrackEdge>();
   adj = new Map<string, { edge: TrackEdge; to: string }[]>();
 
-  addEdge(a: string, b: string, tracks: 1 | 2 = 1, kmh = 110, dfc = false): TrackEdge {
+  addEdge(a: string, b: string, tracks: 1 | 2 = 1, kmh = 110, dfc = false, gauge: Gauge = 'bg'): TrackEdge {
     const id = edgeId(a, b);
     const existing = this.edges.get(id);
     if (existing) return existing;
     const length = distance(a, b);
     const e: TrackEdge = {
-      id, a, b, length, tracks, kmh, works: null, dfc, occupants: new Map(), dfcOccupants: new Map(), util: 0, held: 0, speedFactor: 1,
+      id, a, b, length, tracks, kmh, works: null, dfc, gauge, occupants: new Map(), dfcOccupants: new Map(), util: 0, held: 0, speedFactor: 1,
+      terrain: terrainProfile(city(a), city(b)),
       blocks: Math.max(1, Math.round(length / BLOCK_UNITS)),
     };
     this.edges.set(id, e);
@@ -163,6 +199,7 @@ export class Network {
       done.add(cur);
       for (const { edge, to } of this.adj.get(cur) ?? []) {
         if (done.has(to) || edge.kmh < (mode.minKmh ?? 0) || (mode.needsDfc && !edge.dfc)) continue;
+        if ((!mode.includeClosed && !isOpen(edge)) || (mode.gauge && edge.gauge !== mode.gauge)) continue;
         // a little per-section overhead keeps routes from zig-zagging through every junction
         const nd = best + edge.length / routeKmh(edge, mode) + 0.02;
         if (nd < (dist.get(to) ?? Infinity)) {
@@ -179,7 +216,16 @@ export class Network {
   }
 
   /** Full node path through a list of stops, or null if any leg is unreachable. */
+  /**
+   * A train cannot change gauge, so its whole route is either broad or metre gauge: try
+   * broad gauge first, then metre gauge.
+   */
   routePath(stops: string[], mode: RouteMode = {}): string[] | null {
+    if (mode.gauge || mode.anyGauge) return this.routeOn(stops, mode);
+    return this.routeOn(stops, { ...mode, gauge: 'bg' }) ?? this.routeOn(stops, { ...mode, gauge: 'mg' });
+  }
+
+  private routeOn(stops: string[], mode: RouteMode): string[] | null {
     if (stops.length < 2) return null;
     const out: string[] = [stops[0]];
     for (let i = 1; i < stops.length; i++) {

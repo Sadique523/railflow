@@ -128,8 +128,11 @@ export class Train {
     return terminal ? { planned: TERMINAL_DWELL, min: MIN_TERMINAL_DWELL } : { planned: INTERMEDIATE_DWELL, min: MIN_INTERMEDIATE_DWELL };
   }
 
+  /** Home-developed technology may run slower than the imported original. */
+  speedMult = 1;
+
   get cruise(): number {
-    return kmhToUpm(this.type.cruiseKmh);
+    return kmhToUpm(this.type.cruiseKmh * this.speedMult);
   }
 
   get accel(): number {

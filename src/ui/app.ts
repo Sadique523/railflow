@@ -56,7 +56,12 @@ export class App {
   private lastCongestion = 0;
 
   constructor(private root: HTMLElement) {
-    this.game = Game.load() ?? new Game();
+    let era: 'modern' | '1951' = 'modern';
+    try {
+      if (localStorage.getItem('railflow-era') === '1951') era = '1951';
+      localStorage.removeItem('railflow-era');
+    } catch { /* ignore */ }
+    this.game = Game.load() ?? new Game(era);
     this.stage = new Stage(root);
     this.world = new World(this.stage.scene);
     this.tracks = new TrackView(this.stage.scene);
@@ -117,15 +122,7 @@ export class App {
         },
       }, 'Soft shadows: on'),
       h('button', { onclick: () => this.game.save() }, 'Save now'),
-      h('button', {
-        onclick: () => {
-          if (confirm('Start a new network? Your current game will be lost.')) {
-            Game.clearSave();
-            this.game.save = () => {};
-            location.reload();
-          }
-        },
-      }, 'New game'),
+      h('button', { onclick: () => { this.ui.menu.classList.remove('open'); this.showNewGame(); } }, 'New game'),
     )));
 
     // toolbar
@@ -192,6 +189,32 @@ export class App {
         h('h3', null, 'Camera'),
         h('p', null, 'Drag to pan · right-drag to rotate · scroll to zoom · ', h('kbd', null, 'WASD'), ' pan · ', h('kbd', null, 'Q'), h('kbd', null, 'E'), ' rotate · ', h('kbd', null, 'Space'), ' pause · ', h('kbd', null, '1–4'), ' speed'),
         h('button', { class: 'cta y', onclick: () => bg.remove() }, this.game.net.edges.size ? 'Back to the network' : 'Start building'),
+      )));
+    this.root.append(bg);
+  }
+
+  /** Pick an era for a fresh game; the choice is handed to the reload through storage. */
+  private showNewGame() {
+    const start = (era: 'modern' | '1951') => {
+      Game.clearSave();
+      try { localStorage.setItem('railflow-era', era); } catch { /* ignore */ }
+      this.game.save = () => {};
+      location.reload();
+    };
+    const bg = h('div', { class: 'modal-bg', onclick: (e: Event) => { if (e.target === bg) bg.remove(); } },
+      h('div', { class: 'shadow' }, h('div', { class: 'modal panel' },
+        h('div', { class: 'lbl' }, 'New game'),
+        h('h1', null, 'CHOOSE AN ERA'),
+        h('p', null, 'Your current network will be lost.'),
+        h('div', { class: 'eras' },
+          h('button', { class: 'era', onclick: () => start('modern') },
+            h('b', null, 'Today'),
+            h('span', null, 'An empty map and ₹600 Cr. Lay your own broad gauge network from scratch and research your way to Vande Bharat and bullet trains.')),
+          h('button', { class: 'era', onclick: () => start('1951') },
+            h('b', null, '1951'),
+            h('span', null, 'Inherit the railways of independent India: broad gauge trunk lines and large metre gauge systems that do not connect. ₹400 Cr. Convert gauge, close the gaps and modernise.')),
+        ),
+        h('button', { class: 'cta', onclick: () => bg.remove() }, 'Cancel'),
       )));
     this.root.append(bg);
   }
@@ -462,8 +485,12 @@ export class App {
           const chk = this.game.canBuildTrack(this.trackFrom, cityId);
           this.tracks.showGhost(this.trackFrom, to, chk.ok);
           tip.innerHTML = '';
+          const t = chk.terrain;
+          const hard = t.label ? `${t.label}${t.kmhCap ? `, max ${t.kmhCap} km/h` : ''}` : '';
+          const bridges = t.bridges.length ? `${t.bridges.length} river bridge${t.bridges.length > 1 ? 's' : ''} (${t.bridges.join(', ')})` : '';
           tip.append(
-            `${city(this.trackFrom).name} → ${city(cityId).name} · ${Math.round(km(distance(this.trackFrom, cityId)))} km · ${fmt.cr(chk.cost)}`,
+            `${city(this.trackFrom).name} → ${city(cityId).name} · ${Math.round(km(distance(this.trackFrom, cityId)))} km · ${fmt.cr(chk.cost)} · ${fmt.dur(chk.hours * 60)} to build`,
+            hard || bridges ? h('div', { class: 'terrain' }, [hard, bridges].filter(Boolean).join(' · ')) : '',
             chk.ok ? '' : h('div', { class: 'bad' }, chk.reason!),
           );
         } else {

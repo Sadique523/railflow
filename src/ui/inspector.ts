@@ -3,10 +3,11 @@ import { km } from '../sim/network';
 import { LINE_CLASSES, RESEARCH, RESEARCH_BY_ID, WORKS_SPEED, lineClass } from '../data/research';
 import { PAX_CLASSES, PAX_CLASS_INFO, TRAIN_TYPES } from '../data/trainTypes';
 import { COMMODITY_INFO, cityFreight } from '../data/freight';
-import { DFC } from '../data/research';
+import { DFC, PathChoice } from '../data/research';
+import { lineTopKmh, slowedByWorks } from '../sim/network';
+import { Game } from '../sim/game';
 import { lineLoad } from '../render/tracks';
 import { ON_TIME_MIN } from '../sim/train';
-import type { Game } from '../sim/game';
 import type { Bucket } from '../sim/ledger';
 import type { Train } from '../sim/train';
 import { fmt, h, svg } from './dom';
@@ -341,6 +342,8 @@ export class Inspector {
     const cls = lineClass(e.kmh);
     const up = g.upgradeInfo(id);
     const dfc = g.dfcInfo(id);
+    const gauge = g.gaugeInfo(id);
+    const tr = e.terrain;
     const dbl = g.doubleInfo(id);
     const w = e.works;
     const div = w || users.length ? g.diversions(id) : null;
@@ -351,8 +354,11 @@ export class Inspector {
       h('div', { class: 'scroll' },
         h('div', { class: 'section' },
           h('div', { class: 'kv' },
-            h('span', null, 'Line'), h('span', null, e.tracks === 2 ? 'Double track' : 'Single track'),
-            h('span', null, 'Line speed'), h('span', null, h('i', { class: 'linesw', style: `background:${cls.color}` }), `${cls.kmh} km/h · ${cls.name}`),
+            h('span', null, 'Line'), h('span', null, `${e.gauge === 'mg' ? 'Metre gauge' : 'Broad gauge'} · ${e.tracks === 2 ? 'double track' : 'single track'}`),
+            tr.label ? h('span', null, 'Terrain') : '', tr.label ? h('span', null, `${tr.label}${tr.kmhCap && e.kmh < 300 ? `, max ${tr.kmhCap} km/h` : ''}`) : '',
+            tr.bridges.length ? h('span', null, 'Bridges') : '', tr.bridges.length ? h('span', null, tr.bridges.join(', ')) : '',
+            h('span', null, 'Line speed'), h('span', null, h('i', { class: 'linesw', style: `background:${cls.color}` }),
+              lineTopKmh(e) < cls.kmh ? `${lineTopKmh(e)} km/h (${e.gauge === 'mg' ? 'metre gauge' : 'terrain'})` : `${cls.kmh} km/h · ${cls.name}`),
             h('span', null, 'Signal blocks'), h('span', null, `${e.blocks}${e.tracks === 1 && e.blocks > 1 ? ` · ${e.blocks - 1} crossing loop${e.blocks > 2 ? 's' : ''}` : ''}`),
             h('span', null, 'Condition'), h('span', null, e.speedFactor < 1 ? `Restricted ${Math.round(e.speedFactor * 100)}%` : 'Normal'),
             h('span', null, 'Occupied'), h('span', null, e.occupants.size ? `${e.occupants.size} train${e.occupants.size > 1 ? 's' : ''}` : 'Clear'),
@@ -363,10 +369,16 @@ export class Inspector {
         ),
         w ? h('div', { class: 'section works' },
           h('div', { class: 'lbl', style: 'justify-content:space-between' },
-            w.kind === 'upgrade' ? `Works: upgrading to ${w.toKmh} km/h` : w.kind === 'dfc' ? 'Works: freight corridor' : 'Works: doubling the line',
-            h('span', null, `done ${fmt.clock(w.end)} day ${fmt.day(w.end)}`)),
-          h('div', { class: 'loadbar works-bar' }, h('i', { style: `width:${pct}%` })),
-          w.kind === 'dfc' ? h('p', { class: 'hint' }, 'Built alongside the running line, so traffic keeps moving normally.') : h('p', { class: 'hint' }, `Trains are limited to ${Math.round(e.kmh * WORKS_SPEED)} km/h through the site`,
+            {
+              build: 'Under construction', gauge: 'Converting to broad gauge', dfc: 'Works: freight corridor', double: 'Works: doubling the line',
+              upgrade: (w.toKmh ?? 0) >= 300 ? (w.landEnd && !w.landPaid ? 'High-speed line: acquiring land' : 'High-speed line: building viaduct') : `Works: upgrading to ${w.toKmh} km/h`,
+            }[w.kind],
+            h('span', null, w.landEnd && !w.landPaid ? 'finish date unknown' : `done ${fmt.clock(w.end)} day ${fmt.day(w.end)}`)),
+          h('div', { class: 'loadbar works-bar' }, h('i', { style: `width:${w.landEnd && !w.landPaid ? Math.min(100, ((g.time - w.start) / (w.landEnd - w.start)) * 100) : pct}%` })),
+          w.kind === 'build' ? h('p', { class: 'hint' }, 'No trains can use the line until it opens.')
+          : w.kind === 'gauge' ? h('p', { class: 'hint' }, 'The line is closed while it is relaid to broad gauge. ', users.length ? h('b', { class: 'neg' }, `${users.length} train${users.length > 1 ? 's are' : ' is'} stranded until it reopens.`) : '')
+          : w.landEnd && !w.landPaid ? h('p', { class: 'hint' }, 'Buying land along the route. How long it takes, and what it finally costs, depends on negotiations; any overrun is billed when it completes. The existing line keeps running.')
+          : !slowedByWorks(e) ? h('p', { class: 'hint' }, 'Built alongside the running line, so traffic keeps moving normally.') : h('p', { class: 'hint' }, `Trains are limited to ${Math.round(e.kmh * WORKS_SPEED)} km/h through the site`,
             w.kind === 'upgrade' && e.tracks === 2 ? ' and share one track while the other is relaid.' : '.',
             !users.length ? ' All trains are diverting via other lines.'
               : div && div.stuck.length ? h('b', { class: 'neg' }, ` ${div.stuck.length} train${div.stuck.length > 1 ? 's have' : ' has'} no other way round.`)
@@ -382,7 +394,7 @@ export class Inspector {
                 div?.stuck.includes(t) && w ? h('span', { class: 'r neg' }, 'no diversion') : null)))
             : h('div', { class: 'empty' }, 'None'),
         ),
-        !w && (up.toKmh || dbl.cost || !e.dfc) ? h('div', { class: 'section' },
+        !w && (up.toKmh || dbl.cost || !e.dfc || e.gauge === 'mg') ? h('div', { class: 'section' },
           h('div', { class: 'lbl' }, 'Improve this line'),
           div && div.users.length
             ? h('p', { class: 'hint', style: 'margin:0 0 8px' }, 'Works slow the line for days. ',
@@ -399,7 +411,11 @@ export class Inspector {
             class: 'btn wide', disabled: !dbl.ok, title: dbl.reason ?? '',
             onclick: () => g.upgradeTrack(id),
           }, dbl.ok ? `Double the line · ${fmt.cr(dbl.cost!)} · ${days(dbl.hours!)}` : `Double: ${dbl.reason}`) : null,
-          !e.dfc ? h('button', {
+          e.gauge === 'mg' ? h('button', {
+            class: 'btn wide', disabled: !gauge.ok, title: gauge.reason ?? '',
+            onclick: () => g.convertGauge(id),
+          }, gauge.ok ? `Convert to broad gauge · ${fmt.cr(gauge.cost!)} · line closed ${days(gauge.hours!)}` : `Convert to broad gauge: ${gauge.reason}`) : null,
+          !e.dfc && e.gauge === 'bg' ? h('button', {
             class: 'btn wide', disabled: !dfc.ok, title: dfc.reason ?? '',
             onclick: () => g.buildDfc(id),
           }, dfc.ok ? `Build freight corridor alongside · ${fmt.cr(dfc.cost!)} · ${days(dfc.hours!)}, no disruption` : `Freight corridor: ${dfc.reason}`) : null,
@@ -434,22 +450,31 @@ export class Inspector {
           h('div', { class: 'research' }, RESEARCH.map((r) => {
             const done = g.research.done.has(r.id);
             const running = a?.id === r.id;
-            const chk = g.canResearch(r.id);
+            const chk = g.canResearch(r.id, r.paths ? 'import' : undefined);
+            const chosen = g.research.paths[r.id] ?? a?.path;
             const blocked = r.requires.some((q) => !g.research.done.has(q));
             const pct = running ? Math.min(100, ((g.time - a!.start) / (a!.end - a!.start)) * 100) : 0;
             return h('div', { class: `rcard${done ? ' done' : running ? ' running' : blocked ? ' blocked' : ''}` },
               h('div', { class: 'top' },
                 h('b', null, r.name),
-                h('span', { class: 'st' }, done ? 'Done' : running ? `${Math.round(pct)}%` : `${fmt.cr(r.cost)} · ${r.hours} h`)),
+                h('span', { class: 'st' }, done ? 'Done' : running ? `${Math.round(pct)}%` : r.paths ? 'Two ways' : `${fmt.cr(r.cost)} · ${r.hours} h`)),
               h('div', { class: 'blurb' }, r.blurb),
               h('div', { class: 'unl' }, 'Unlocks: ', h('b', null, r.unlocks)),
               r.requires.length ? h('div', { class: 'req' }, `Needs ${r.requires.map((q) => RESEARCH_BY_ID.get(q)!.name).join(' + ')}`) : null,
               running ? h('div', { class: 'loadbar' }, h('i', { style: `width:${pct}%` })) : null,
               running ? h('div', { class: 'req' }, `Ready ${fmt.clock(a!.end)}, day ${fmt.day(a!.end)}`) : null,
-              !done && !running ? h('button', {
+              (done || running) && chosen && r.paths ? h('div', { class: 'req' }, `${r.paths[chosen].label}: ${r.paths[chosen].note}`) : '',
+              !done && !running && !r.paths ? h('button', {
                 class: 'btn', disabled: !chk.ok, title: chk.reason ?? '',
                 onclick: () => g.startResearch(r.id),
               }, chk.ok ? `Start · ${fmt.cr(r.cost)}` : chk.reason!) : null,
+              !done && !running && r.paths ? h('div', { class: 'paths' }, (['import', 'home'] as PathChoice[]).map((pc) => {
+                const pth = r.paths![pc];
+                const ok = g.canResearch(r.id, pc);
+                return h('button', { class: 'path', disabled: !ok.ok, title: ok.reason ?? '', onclick: () => g.startResearch(r.id, pc) },
+                  h('b', null, pth.label), h('span', null, `${fmt.cr(Game.projectTerms(r, pc).cost)} · ${pth.hours} h`), h('em', null, pth.note));
+              })) : null,
+              !done && !running && r.paths && !chk.ok && chk.reason !== 'Not enough funds' ? h('div', { class: 'req' }, chk.reason!) : null,
             );
           })),
         ),

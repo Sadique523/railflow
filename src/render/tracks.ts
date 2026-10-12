@@ -6,10 +6,12 @@ import { GeoBuilder, PRIM, VCOL } from './batch';
 import { PAL } from './models';
 import { DFC, dfcOffset, lineClass } from '../data/research';
 import type { Game } from '../sim/game';
-import type { TrackEdge } from '../sim/network';
+import type { TrackEdge, Works } from '../sim/network';
 
 const SLEEPER_STEP = 0.5;
 const GAUGE = 0.24; // half distance between rails
+const MG_GAUGE = 0.15; // metre gauge
+const MG_BED = '#7d8bb5';
 const MAST_STEP = 7;
 const LOOP_LEN = 7;
 const LOOP_X = -1.3;
@@ -19,15 +21,15 @@ export function formationWidth(tracks: number): number {
 }
 
 /** One running line: ballast shoulder, sleepers and two rails along z ∈ [z0, z1]. */
-function lane(b: GeoBuilder, x: number, z0: number, z1: number, sleepers = true) {
+function lane(b: GeoBuilder, x: number, z0: number, z1: number, sleepers = true, gauge = GAUGE) {
   const len = z1 - z0;
   const zc = (z0 + z1) / 2;
   b.put(PRIM.trapezoid, PAL.ballast, x, 0.145, zc, 1.3, 0.13, len);
   if (sleepers) {
     const n = Math.floor(len / SLEEPER_STEP);
-    for (let k = 0; k < n; k++) b.box(PAL.concrete, x, 0.235, z0 + (k + 0.5) * SLEEPER_STEP, 0.95, 0.05, 0.16);
+    for (let k = 0; k < n; k++) b.box(PAL.concrete, x, 0.235, z0 + (k + 0.5) * SLEEPER_STEP, gauge * 4, 0.05, 0.16);
   }
-  for (const sx of [-GAUGE, GAUGE]) {
+  for (const sx of [-gauge, gauge]) {
     b.box(PAL.dark, x + sx, 0.29, zc, 0.04, 0.06, len);
     b.box(PAL.steel, x + sx, 0.33, zc, 0.075, 0.025, len);
   }
@@ -110,15 +112,23 @@ function buildEdgeGeometry(e: TrackEdge): { geo: THREE.BufferGeometry; len: numb
   const b = new GeoBuilder();
   const fw = formationWidth(e.tracks);
   const lanes = e.tracks === 2 ? [-CAR.lane, CAR.lane] : [0];
-  const bed = lineClass(e.kmh).color;
+  const mg = e.gauge === 'mg';
+  const closed = e.works?.kind === 'build' || e.works?.kind === 'gauge';
+  const bed = closed ? PAL.ballast : mg ? MG_BED : lineClass(e.kmh).color;
 
   b.box(bed, 0, 0.04, 0, fw, 0.08, len);
-  for (const lx of lanes) lane(b, lx, z0, z1);
+  if (closed) {
+    // a line being built, or relaid to broad gauge: earthworks and ballast, no rails yet
+    for (const lx of lanes) b.put(PRIM.trapezoid, PAL.ballast, lx, 0.145, 0, 1.3, 0.13, len);
+    worksSite(b, e.works!, fw, z0 + halfA + 1, z1 - halfB - 1, dfcOffset(e.tracks));
+    return { geo: b.build(), len };
+  }
+  for (const lx of lanes) lane(b, lx, z0, z1, true, mg ? MG_GAUGE : GAUGE);
 
-  // overhead electrification, kept out of the station areas and their sheds
+  // overhead electrification (not on metre gauge), kept out of the station areas and their sheds
   const wz0 = z0 + halfA + 3.5;
   const wz1 = z1 - halfB - 3.5;
-  if (wz1 - wz0 > 2) {
+  if (wz1 - wz0 > 2 && !mg) {
     const masts = Math.max(2, Math.round((wz1 - wz0) / MAST_STEP) + 1);
     const sides = e.tracks === 2 ? [-1, 1] : [1];
     for (let i = 0; i < masts; i++) {
@@ -167,7 +177,7 @@ function buildEdgeGeometry(e: TrackEdge): { geo: THREE.BufferGeometry; len: numb
     trainShed(b, e.tracks === 2 ? -px - 0.7 : -0.95, px + 0.7, pz0 - 0.4, pz1 + 0.4);
   }
   if (e.dfc) freightCorridor(b, dfcOffset(e.tracks), z0, z1);
-  if (e.works) worksSite(b, e.works.kind, fw, z0 + halfA + 4, z1 - halfB - 4, dfcOffset(e.tracks));
+  if (e.works) worksSite(b, e.works, fw, z0 + halfA + 4, z1 - halfB - 4, dfcOffset(e.tracks));
   return { geo: b.build(), len };
 }
 
@@ -188,8 +198,15 @@ function freightCorridor(b: GeoBuilder, x: number, z0: number, z1: number) {
 }
 
 /** Barriers along the line and work machines dotted along it. */
-function worksSite(b: GeoBuilder, kind: 'upgrade' | 'double' | 'dfc', fw: number, z0: number, z1: number, dfcX: number) {
+function worksSite(b: GeoBuilder, w: Works, fw: number, z0: number, z1: number, dfcX: number) {
   if (z1 - z0 < 4) return;
+  // corridors and high-speed lines go up alongside; everything else happens on the line itself
+  const kind = w.kind === 'dfc' || (w.kind === 'upgrade' && (w.toKmh ?? 0) >= 300) ? 'dfc' : w.kind;
+  if (w.landEnd && !w.landPaid) {
+    // land acquisition: survey pegs only
+    for (let z = z0; z <= z1; z += 3) b.block(PAL.yellow, dfcX, 0.08, z, 0.12, 0.5, 0.12);
+    return;
+  }
   let side = fw / 2 + 0.35;
   if (kind === 'double') {
     // the new formation being laid alongside
@@ -238,7 +255,7 @@ export class TrackView {
   }
 
   sync(game: Game) {
-    const keyOf = (e: TrackEdge) => `${e.tracks}|${e.kmh}|${e.dfc}|${e.works?.kind ?? ''}`;
+    const keyOf = (e: TrackEdge) => `${e.tracks}|${e.kmh}|${e.dfc}|${e.gauge}|${e.works?.kind ?? ''}|${e.works?.landPaid ?? ''}`;
     for (const [id, v] of this.views) {
       const e = game.net.edges.get(id);
       if (!e || keyOf(e) !== v.key) {
