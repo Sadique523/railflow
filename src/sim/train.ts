@@ -1,7 +1,8 @@
-import { CAR, TRAIN_TYPE_BY_ID, TrainType, trainCapacity, trainLength } from '../data/trainTypes';
+import { CAR, PaxClass, TRAIN_TYPE_BY_ID, TrainType, trainCapacity, trainLength } from '../data/trainTypes';
 import { KM_PER_UNIT } from '../data/geo';
 import { city } from '../data/cities';
-import type { Network, TrackEdge } from './network';
+import { Network, TrackEdge, km, lineKmh, liveTracks } from './network';
+import { Ledger } from './ledger';
 
 export interface TrainConfig {
   id: string;
@@ -13,6 +14,7 @@ export interface TrainConfig {
 }
 
 export interface PaxGroup {
+  cls: PaxClass;
   origin: string;
   dest: string;
   count: number;
@@ -56,7 +58,6 @@ export class Train {
   stopIdx: number[] = [];
   nextStop = 0; // index into stopIdx
   pos = 0; // head distance along path
-  rollTo = 0; // terminal siding position the head rolls to while dwelling
   v = 0; // units / min
   segs: Segment[] = [];
   seg = 0; // block the head is in (or waiting to enter)
@@ -69,6 +70,10 @@ export class Train {
   holding = false; // waiting for a signal (blocked edge)
   passengers: PaxGroup[] = [];
   tripStartedAt = 0;
+  /** Fares and running costs booked to this train. */
+  money: Ledger;
+  tripFares = 0; // fares collected so far on the current end-to-end run
+  lastTripFares: number | null = null;
 
   constructor(public cfg: TrainConfig) {
     const t = TRAIN_TYPE_BY_ID.get(cfg.typeId);
@@ -76,6 +81,7 @@ export class Train {
     this.type = t;
     this.length = trainLength(cfg.coaches);
     this.capacity = trainCapacity(t, cfg.coaches);
+    this.money = new Ledger(0);
   }
 
   get seats(): number {
@@ -113,13 +119,46 @@ export class Train {
     return this.path[this.stopIdx[this.nextStop]] ?? this.path[this.path.length - 1];
   }
 
-  /** Planned minutes to cover `d` units, including accel/brake overhead. */
-  plannedTravel(d: number): number {
-    return (d / this.cruise) * 1.06 + this.cruise / this.accel + 1;
+  /** Top speed on a line right now (train or line limit, whichever is lower), units/min. */
+  vmaxOn(e: TrackEdge): number {
+    return Math.min(this.cruise, kmhToUpm(lineKmh(e)));
+  }
+
+  /**
+   * Timetabled minutes between two path indices: each section at its line speed (planned
+   * works included), plus a margin and the accel/brake overhead of one stop-to-stop run.
+   */
+  legTime(net: Network, from: number, to: number): number {
+    let t = 0;
+    let top = 0;
+    for (let i = from + 1; i <= to; i++) {
+      const e = net.edge(this.path[i - 1], this.path[i])!;
+      const v = this.vmaxOn(e);
+      t += e.length / v;
+      top = Math.max(top, v);
+    }
+    return t * 1.06 + top / this.accel + 1;
+  }
+
+  /** End-to-end journey minutes including stops, for the current path. */
+  journeyTime(net: Network): number {
+    let t = 0;
+    for (let k = 1; k < this.stopIdx.length; k++) {
+      t += this.legTime(net, this.stopIdx[k - 1], this.stopIdx[k]);
+      if (k < this.stopIdx.length - 1) t += INTERMEDIATE_DWELL;
+    }
+    return t;
+  }
+
+  /** Average door-to-door speed over the route, km/h. Passengers respond to this. */
+  serviceKmh = 0;
+
+  carries(cls: PaxClass): boolean {
+    return this.type.fares[cls] !== undefined;
   }
 
   buildPath(net: Network): boolean {
-    const p = net.routePath(this.dirStops);
+    const p = net.routePath(this.dirStops, this.type.needsLineKmh ?? 0);
     if (!p) return false;
     this.path = p;
     this.cum = [0];
@@ -145,6 +184,7 @@ export class Train {
     for (let i = 0; i < p.length && k < stops.length; i++) {
       if (p[i] === stops[k]) { this.stopIdx.push(i); k++; }
     }
+    this.serviceKmh = km(this.totalLen) / (this.journeyTime(net) / 60);
     return true;
   }
 
@@ -152,17 +192,32 @@ export class Train {
   start(net: Network, now: number, departAt: number): boolean {
     this.dir = 1;
     if (!this.buildPath(net)) return false;
-    this.pos = 0;
-    this.rollTo = 0;
+    this.placeAtOrigin();
     this.v = 0;
-    this.seg = 0;
-    this.onSeg = false;
     this.nextStop = 1;
     this.state = 'dwelling';
     this.schedDep = departAt;
     this.dwellUntil = departAt;
     this.tripStartedAt = now;
     return true;
+  }
+
+  /**
+   * Stand the train in the platform at the start of its path: the rake lies along the
+   * first line out with its tail at the station, so a reversing push-pull train just
+   * changes ends instead of running past the buffers.
+   */
+  placeAtOrigin() {
+    const firstStop = this.cum[this.stopIdx[1]] ?? this.totalLen;
+    this.pos = Math.max(0, Math.min(this.length, firstStop - 1));
+    this.seg = 0;
+    while (this.seg < this.segs.length - 1 && this.segs[this.seg].end <= this.pos) this.seg++;
+    this.onSeg = false;
+  }
+
+  /** Running cost per game hour. */
+  get runningCostPerHour(): number {
+    return this.type.opCostPerHour + this.type.opCostPerCoachHour * this.cfg.coaches;
   }
 
   get totalLen(): number {
@@ -192,7 +247,7 @@ export class Train {
     let z = a.z + (b.z - a.z) * t;
     // left-hand running on double track, easing to centre at stations
     const e = net.edge(p[i], p[i + 1]);
-    if (e && e.tracks === 2) {
+    if (e && liveTracks(e) === 2) {
       const along = d - this.cum[i];
       const ease = Math.min(1, Math.max(0, Math.min(along, len - along) / 4));
       const off = CAR.lane * ease * ease * (3 - 2 * ease);

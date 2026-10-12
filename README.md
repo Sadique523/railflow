@@ -17,10 +17,16 @@ npm run build    # production build in dist/
 | `T` | Track tool: click a city, then another. Keep clicking to chain lines. Right-click/Esc cancels. |
 | `N` | New train: pick a preset, number of coaches and stops (click cities on the map or use the list). |
 | `V` / `Esc` | Select: click a station, train or line to inspect it. |
+| `R` | Research: unlock train types, faster track and Kavach, one project at a time. |
+| `M` | Money: profit per hour, a 24 h chart of fares vs running costs, and profit by train. Also opens from the Funds panel. |
 | Drag / right-drag / wheel | Pan / rotate / zoom (also `WASD`, `Q`/`E`). |
 | `Space`, `1`–`4` | Pause, game speed. |
 
-Trains shuttle back and forth between their first and last stop and call at every stop in between.
+You start with MEMU and Express trains on 110 km/h track. Research unlocks LHB coaches (Shatabdi, Rajdhani), 130 km/h track, Kavach train protection, Vande Bharat, 160 km/h track and finally high-speed lines with the bullet train. A train only runs as fast as the line allows, so new trains need upgraded lines. Upgrading or doubling a line means days of works: the line drops to a quarter of its speed (and to one track if it was double), and trains divert by the fastest way round if you have built one. Lines above 110 km/h without Kavach see signal incidents.
+
+Passengers come in three classes. Most travel general class and only board cheap trains (MEMU, Express); a smaller AC crowd and a thin premium crowd pay more, ride the premium trains and care most about speed. Faster and more frequent service between two stations brings more passengers.
+
+Trains shuttle back and forth between their first and last stop and call at every stop in between. At the end of the line they stop under the station's train shed and change ends (push-pull) instead of running round.
 
 ## Scoring
 
@@ -28,15 +34,18 @@ Trains shuttle back and forth between their first and last stop and call at ever
 - **Punctuality**: share of the last 60 arrivals that were within 5 minutes of the timetable.
 - **Score**: every delivered passenger adds points scaled by trip length and happiness, with a bonus for on-time arrivals.
 - **Rating**: A+ to E, from happiness and punctuality combined.
-- **Funds** (₹ Cr): fares come in, and track, trains and per-hour running costs go out.
+- **Upkeep**: every km of track costs money each day, more for double and faster lines, so do not build lines nobody uses.
+- **Funds** (₹ Cr): fares come in when passengers get off (a green `+₹` pops up at the station), and track, trains and per-hour running costs go out. The arrow next to Funds is your profit per hour.
 
 Single lines are split into ~50 km signal blocks with crossing loops between them. Opposing trains have to wait at a loop to cross. Doubling a line lets them pass freely and lets trains follow closely. Random fog, monsoon rain, signal failures and festival rushes keep things interesting.
 
 ## Code map
 
-- `src/data`: cities (lat/lon/population), coastline and projection, train presets (`trainTypes.ts`; add new types here for custom trains later)
-- `src/sim`: pure simulation: `network.ts` (track graph, Dijkstra), `train.ts` (path, blocks, timetable), `game.ts` (signalling, passengers, economy, events, save/load)
-- `src/render`: Three.js scene: `stage.ts` (camera, lights, AO), `world.ts` (land, stations, buildings), `tracks.ts`, `trains.ts`
+- `src/data`: cities (lat/lon/population), projection, world and play-area extents (`geo.ts`), country borders and rivers (`mapdata.json`), train presets (`trainTypes.ts`; add new types here for custom trains later)
+- `src/sim`: pure simulation: `network.ts` (track graph, Dijkstra), `train.ts` (path, blocks, timetable), `game.ts` (signalling, passengers, economy, events, save/load), `ledger.ts` (money booked by flow and hour); `src/data/research.ts` holds the research tree and line speed classes
+- `src/render`: Three.js scene: `stage.ts` (camera, lights, AO), `terrain.ts` (endless sea, land plates, painted map, haze), `world.ts` (stations, buildings), `tracks.ts`, `trains.ts`
 - `src/ui`: HUD and panels (`app.ts` controller, `builder.ts` train builder, `inspector.ts`)
+
+`mapdata.json` is generated from [Natural Earth](https://www.naturalearthdata.com/) (public domain) by `scripts/build-mapdata.mjs`; see the script header for how to rebuild it.
 
 Progress autosaves to `localStorage` every 15 seconds.

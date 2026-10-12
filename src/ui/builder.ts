@@ -1,5 +1,6 @@
 import { CITIES, city } from '../data/cities';
-import { TRAIN_TYPES, TRAIN_TYPE_BY_ID, trainCapacity, trainCost, trainSeats } from '../data/trainTypes';
+import { PAX_CLASSES, PAX_CLASS_INFO, TRAIN_TYPES, TRAIN_TYPE_BY_ID, TrainType, trainCapacity, trainCost, trainSeats } from '../data/trainTypes';
+import { RESEARCH_BY_ID } from '../data/research';
 import { km } from '../sim/network';
 import { Train } from '../sim/train';
 import type { Game } from '../sim/game';
@@ -15,8 +16,8 @@ export interface BuilderHost {
 /** The "New train" panel: pick a preset, a formation and a list of stops. */
 export class TrainBuilder {
   el: HTMLElement;
-  typeId = 'vande';
-  coaches = TRAIN_TYPE_BY_ID.get('vande')!.defaultCoaches;
+  typeId = 'mail';
+  coaches = TRAIN_TYPE_BY_ID.get('mail')!.defaultCoaches;
   stops: string[] = [];
   private body: HTMLElement;
   private summary!: HTMLElement;
@@ -63,11 +64,15 @@ export class TrainBuilder {
   }
 
   private routeChanged() {
-    const info = this.host.game.routeInfo(this.stops);
+    const info = this.host.game.routeInfo(this.stops, this.typeId);
     this.host.onRoute(info.ok ? info.path! : null, this.stops);
   }
 
   render() {
+    if (!this.host.game.isResearched(this.type.research)) {
+      this.typeId = 'mail';
+      this.coaches = this.type.defaultCoaches;
+    }
     const t = this.type;
     const scroll = this.body.scrollTop;
     this.body.replaceChildren(
@@ -89,10 +94,14 @@ export class TrainBuilder {
   }
 
   private typeSection() {
+    const g = this.host.game;
     const list = h('div', { class: 'types' },
-      TRAIN_TYPES.map((t) =>
-        h('button', {
-          class: `type${t.id === this.typeId ? ' on' : ''}`,
+      TRAIN_TYPES.map((t) => {
+        const locked = !g.isResearched(t.research);
+        return h('button', {
+          class: `type${t.id === this.typeId ? ' on' : ''}${locked ? ' locked' : ''}`,
+          disabled: locked,
+          title: locked ? `Unlocked by research: ${RESEARCH_BY_ID.get(t.research!)!.name}` : '',
           onclick: () => {
             this.typeId = t.id;
             this.coaches = t.defaultCoaches;
@@ -101,10 +110,10 @@ export class TrainBuilder {
         },
         h('span', { class: 'stripe', style: `background:${t.accent}` }),
         h('span', { class: 'nm' }, t.name),
-        h('span', { class: 'price' }, fmt.cr(trainCost(t, t.defaultCoaches))),
-        h('span', { class: 'meta' }, `${t.cruiseKmh} km/h · comfort ${t.comfort >= 0 ? '+' : ''}${t.comfort} · fare ×${t.fareMult}`),
-        ),
-      ),
+        h('span', { class: 'price' }, locked ? `🔒 ${RESEARCH_BY_ID.get(t.research!)!.name}` : fmt.cr(trainCost(t, t.defaultCoaches))),
+        h('span', { class: 'meta' }, `${t.cruiseKmh} km/h · `, classTags(t)),
+        );
+      }),
     );
     return h('div', { class: 'section' },
       h('div', { class: 'lbl' }, h('span', { class: 'n' }, '01'), 'Train type'),
@@ -181,21 +190,21 @@ export class TrainBuilder {
   private renderSummary() {
     const g = this.host.game;
     const t = this.type;
-    const info = g.routeInfo(this.stops);
+    const info = g.routeInfo(this.stops, t.id);
     const cost = trainCost(t, this.coaches);
     const rows: (string | HTMLElement)[] = [];
-    let journey = 0;
+    let slowLine = 0;
     if (info.ok) {
       const probe = new Train({ id: 'probe', number: '', name: '', typeId: t.id, coaches: this.coaches, stops: this.stops });
       probe.buildPath(g.net);
-      for (let k = 1; k < probe.stopIdx.length; k++) {
-        journey += probe.plannedTravel(probe.cum[probe.stopIdx[k]] - probe.cum[probe.stopIdx[k - 1]]);
-        if (k < probe.stopIdx.length - 1) journey += Train.INTERMEDIATE_DWELL;
+      for (let i = 1; i < probe.path.length; i++) {
+        const e = g.net.edge(probe.path[i - 1], probe.path[i])!;
+        if (e.kmh < t.cruiseKmh) slowLine = slowLine ? Math.min(slowLine, e.kmh) : e.kmh;
       }
       rows.push(
         h('span', null, 'Route'), h('span', null, `${city(this.stops[0]).name} → ${city(this.stops[this.stops.length - 1]).name}`),
         h('span', null, 'Distance'), h('span', null, `${fmt.int(km(info.length!))} km`),
-        h('span', null, 'Journey'), h('span', null, fmt.dur(journey)),
+        h('span', null, 'Journey'), h('span', null, `${fmt.dur(probe.journeyTime(g.net))} · avg ${Math.round(probe.serviceKmh)} km/h`),
       );
     }
     const opDay = (t.opCostPerHour + t.opCostPerCoachHour * this.coaches) * 24;
@@ -220,7 +229,14 @@ export class TrainBuilder {
     this.summary.replaceChildren(
       h('div', { class: 'lbl' }, h('span', { class: 'n' }, '04'), 'Summary'),
       h('div', { class: 'kv' }, rows),
+      slowLine ? h('p', { class: 'hint' }, `Parts of this route are only ${slowLine} km/h, so this ${t.cruiseKmh} km/h train will be held back. `, h('b', null, 'Upgrade the lines'), ' to get its full speed.') : '',
     );
     this.footer.replaceChildren(btn);
   }
+}
+
+/** Small coloured tags for the passenger classes a train type carries. */
+function classTags(t: TrainType): HTMLElement {
+  return h('span', { class: 'cls-tags' }, PAX_CLASSES.filter((c) => t.fares[c] !== undefined).map((c) =>
+    h('span', { class: 'cls', style: `--c:${PAX_CLASS_INFO[c].color}` }, PAX_CLASS_INFO[c].name)));
 }

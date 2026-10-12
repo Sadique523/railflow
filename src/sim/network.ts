@@ -1,5 +1,14 @@
 import { city } from '../data/cities';
 import { KM_PER_UNIT } from '../data/geo';
+import { WORKS_SPEED } from '../data/research';
+
+/** Engineering works on a line: an upgrade to a faster class, or doubling. */
+export interface Works {
+  kind: 'upgrade' | 'double';
+  toKmh?: number; // upgrade target
+  start: number; // game minutes
+  end: number;
+}
 
 export interface TrackEdge {
   id: string;
@@ -7,6 +16,9 @@ export interface TrackEdge {
   b: string;
   length: number; // world units
   tracks: 1 | 2;
+  /** Line speed class (max km/h). */
+  kmh: number;
+  works: Works | null;
   /** Number of signal blocks; crossing loops sit between them. */
   blocks: number;
   /** Runtime: trains whose head is on this edge: travel direction (+1 = a→b) and block. */
@@ -43,17 +55,27 @@ export function doubleCost(e: TrackEdge): number {
   return km(e.length) * DOUBLE_COST_PER_KM;
 }
 
+/** Tracks in use: a double line under upgrade works runs on one track while the other is relaid. */
+export function liveTracks(e: TrackEdge): 1 | 2 {
+  return e.works?.kind === 'upgrade' ? 1 : e.tracks;
+}
+
+/** Line speed limit in km/h, allowing for works (events are applied separately). */
+export function lineKmh(e: TrackEdge): number {
+  return e.kmh * (e.works ? WORKS_SPEED : 1);
+}
+
 export class Network {
   edges = new Map<string, TrackEdge>();
   adj = new Map<string, { edge: TrackEdge; to: string }[]>();
 
-  addEdge(a: string, b: string, tracks: 1 | 2 = 1): TrackEdge {
+  addEdge(a: string, b: string, tracks: 1 | 2 = 1, kmh = 110): TrackEdge {
     const id = edgeId(a, b);
     const existing = this.edges.get(id);
     if (existing) return existing;
     const length = distance(a, b);
     const e: TrackEdge = {
-      id, a, b, length, tracks, occupants: new Map(), speedFactor: 1,
+      id, a, b, length, tracks, kmh, works: null, occupants: new Map(), speedFactor: 1,
       blocks: Math.max(1, Math.round(length / BLOCK_UNITS)),
     };
     this.edges.set(id, e);
@@ -87,8 +109,12 @@ export class Network {
     return this.adj.has(cityId);
   }
 
-  /** Dijkstra over track length. Returns node list a..b or null. */
-  shortestPath(a: string, b: string): string[] | null {
+  /**
+   * Dijkstra over running time at line speed, so trains prefer fast lines and divert
+   * around works when there is a quicker way. `minKmh` restricts the search to lines at
+   * least that fast (high-speed trains).
+   */
+  shortestPath(a: string, b: string, minKmh = 0): string[] | null {
     if (a === b) return [a];
     if (!this.adj.has(a) || !this.adj.has(b)) return null;
     const dist = new Map<string, number>([[a, 0]]);
@@ -106,8 +132,9 @@ export class Network {
       if (cur === b) break;
       done.add(cur);
       for (const { edge, to } of this.adj.get(cur) ?? []) {
-        if (done.has(to)) continue;
-        const nd = best + edge.length;
+        if (done.has(to) || edge.kmh < minKmh) continue;
+        // a little per-section overhead keeps routes from zig-zagging through every junction
+        const nd = best + edge.length / lineKmh(edge) + 0.02;
         if (nd < (dist.get(to) ?? Infinity)) {
           dist.set(to, nd);
           prev.set(to, cur);
@@ -122,11 +149,11 @@ export class Network {
   }
 
   /** Full node path through a list of stops, or null if any leg is unreachable. */
-  routePath(stops: string[]): string[] | null {
+  routePath(stops: string[], minKmh = 0): string[] | null {
     if (stops.length < 2) return null;
     const out: string[] = [stops[0]];
     for (let i = 1; i < stops.length; i++) {
-      const leg = this.shortestPath(stops[i - 1], stops[i]);
+      const leg = this.shortestPath(stops[i - 1], stops[i], minKmh);
       if (!leg) return null;
       out.push(...leg.slice(1));
     }

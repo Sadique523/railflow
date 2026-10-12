@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
+import { RESEARCH_BY_ID } from '../data/research';
 import { city } from '../data/cities';
 import { Game } from '../sim/game';
 import { km, distance } from '../sim/network';
@@ -19,6 +21,8 @@ const ICONS = {
   select: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 3l14 8-6 2-2 6z"/></svg>',
   track: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2L5 22M16 2l3 20M6.5 7h11M6 12h12M5.3 17h13.4"/></svg>',
   train: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="3" width="14" height="14" rx="1"/><path d="M5 11h14M8 21l2-4M16 21l-2-4"/></svg>',
+  research: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3h6M10 3v6l-5 9a2 2 0 0 0 2 3h10a2 2 0 0 0 2-3l-5-9V3M7.5 15h9"/></svg>',
+  money: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 4h11M7 9h11M7 4c6 0 6 9 0 9h-1l9 8"/></svg>',
 };
 
 export class App {
@@ -126,15 +130,19 @@ export class App {
       h('button', { class: 'tool', 'data-tool': id, title: `${label} (${key})`, onclick: () => this.setTool(this.tool === id && id !== 'select' ? 'select' : id) },
         svg(ICONS[id]), h('span', { class: 't' }, label), h('span', { class: 'key' }, key));
     r.append((this.ui.toolbar = h('div', { class: 'toolbar shadow' },
-      tool('select', 'Select', 'V'), tool('track', 'Track', 'T'), tool('train', 'Train', 'N'))));
+      tool('select', 'Select', 'V'), tool('track', 'Track', 'T'), tool('train', 'Train', 'N'),
+      (this.ui.researchBtn = h('button', { class: 'tool', title: 'Research (R)', onclick: () => this.togglePanel('research') },
+        svg(ICONS.research), h('span', { class: 't' }, 'Research'), h('span', { class: 'key' }, 'R'))),
+      (this.ui.moneyBtn = h('button', { class: 'tool', title: 'Money (M)', onclick: () => this.toggleMoney() },
+        svg(ICONS.money), h('span', { class: 't' }, 'Money'), h('span', { class: 'key' }, 'M'))))));
 
     // bottom stats
     const segs = (cls: string, key: string) => (this.ui[key] = h('div', { class: `bar ${cls}` }, Array.from({ length: 10 }, () => h('i'))));
-    r.append(h('div', { class: 'shadow' }, h('div', { class: 'stat left panel' },
+    r.append(h('div', { class: 'shadow' }, h('div', { class: 'stat left panel click', title: 'Open money (M)', onclick: () => this.toggleMoney() },
       h('div', { class: 'head' }, h('span', { class: 'swatch y' }), h('span', { class: 'lbl' }, 'Happiness'), (this.ui.happy = h('span', { class: 'val mono' }))),
       segs('y', 'happyBar'),
       h('div', { class: 'foot' },
-        h('span', null, 'Funds:', (this.ui.funds = h('b', { class: 'mono' }))),
+        h('span', null, 'Funds:', (this.ui.funds = h('b', { class: 'mono' })), (this.ui.rate = h('em', { class: 'rate mono' }))),
         h('span', null, 'Pax:', (this.ui.pax = h('b', { class: 'mono' })))),
     )));
     r.append(h('div', { class: 'shadow' }, h('div', { class: 'stat right panel' },
@@ -166,9 +174,11 @@ export class App {
         h('ul', null,
           h('li', null, h('kbd', null, 'T'), ' Track tool: click a city, then another to lay line. Keep clicking to chain.'),
           h('li', null, h('kbd', null, 'N'), ' New train: choose a preset, coaches and stops. It shuttles end to end.'),
-          h('li', null, 'Click a line to ', h('b', null, 'double'), ' it. Single lines make opposing trains wait.')),
+          h('li', null, 'Click a line to ', h('b', null, 'double'), ' or ', h('b', null, 'speed it up'), '. Works slow the line for days, so plan a way round first.'),
+          h('li', null, h('kbd', null, 'R'), ' Research: you start with MEMU and Express. LHB coaches, faster track, Kavach, Vande Bharat and bullet trains come later.')),
         h('h3', null, 'Score'),
         h('ul', null,
+          h('li', null, h('b', null, 'Passengers'), ' — most travel general class and only take cheap trains; a smaller AC and premium crowd pays more and wants speed. Run a mix.'),
           h('li', null, h('b', null, 'Happiness'), ' — short waits, punctual trains, comfort and seats for everyone.'),
           h('li', null, h('b', null, 'Punctuality'), ' — arrivals within 5 minutes of the timetable.'),
           h('li', null, 'Points come from every passenger delivered: longer trips and happier riders score more. Fares pay for running costs.'),
@@ -242,6 +252,8 @@ export class App {
     this.selection = sel;
     if (!sel || sel.kind !== 'train') this.following = null;
     this.inspector.show(sel);
+    this.ui.moneyBtn.classList.toggle('on', sel?.kind === 'finance');
+    this.ui.researchBtn.classList.toggle('on', sel?.kind === 'research');
     this.world.setSelected(sel?.kind === 'city' ? sel.id : null);
     if (sel?.kind === 'train') {
       const t = this.game.trains.get(sel.id)!;
@@ -250,6 +262,17 @@ export class App {
       const e = this.game.net.edges.get(sel.id)!;
       this.tracks.setHighlight([e.a, e.b]);
     } else if (this.tool !== 'train') this.tracks.setHighlight(null);
+  }
+
+  toggleMoney() {
+    this.togglePanel('finance');
+  }
+
+  /** Open or close one of the full-height panels (money, research). */
+  togglePanel(kind: 'finance' | 'research') {
+    if (this.selection?.kind === kind) return this.select(null);
+    if (this.tool !== 'select') this.setTool('select');
+    this.select({ kind });
   }
 
   startTrack(from: string) {
@@ -300,6 +323,8 @@ export class App {
       else if (k === 't') this.setTool(this.tool === 'track' ? 'select' : 'track');
       else if (k === 'n') this.setTool(this.tool === 'train' ? 'select' : 'train');
       else if (k === 'v') this.setTool('select');
+      else if (k === 'm') this.toggleMoney();
+      else if (k === 'r') this.togglePanel('research');
       else if (k === 'escape') {
         if (this.tool === 'track' && this.trackFrom) { this.trackFrom = null; this.tracks.showGhost(null, null, true); }
         else if (this.tool !== 'select') this.setTool('select');
@@ -349,6 +374,7 @@ export class App {
     const g = this.game;
     const speed = SPEEDS[this.speedIdx];
     if (speed) g.update(dt * speed * GAME_MIN_PER_SEC);
+    for (const p of g.payouts.splice(0)) this.cashPop(p.cityId, p.amount);
 
     if (g.version !== this.seenVersion) {
       this.seenVersion = g.version;
@@ -386,6 +412,21 @@ export class App {
       this.lastUi = this.clock;
       this.updateHud();
     }
+  }
+
+  /** Floating "+₹" over a station where a train just collected fares. */
+  private cashPop(cityId: string, amount: number) {
+    if (amount < 0.005) return;
+    const c = city(cityId);
+    const el = h('div', { class: 'cash-pop' }, h('span', null, fmt.money(amount, true)));
+    const obj = new CSS2DObject(el);
+    obj.position.set(c.x, 4, c.z);
+    obj.center.set(0.5, 1);
+    this.stage.scene.add(obj);
+    setTimeout(() => {
+      this.stage.scene.remove(obj);
+      el.remove();
+    }, 2200);
   }
 
   private updateHover() {
@@ -439,15 +480,24 @@ export class App {
     [...u.punctBar.children].forEach((c, i) => c.classList.toggle('on', i < Math.round(pun / 10)));
     u.funds.textContent = fmt.cr(g.funds);
     u.funds.classList.toggle('neg', g.funds < 0);
+    const rate = g.ledger.operatingRate(g.time);
+    u.rate.textContent = g.trains.size ? `${rate >= 0 ? '▲' : '▼'} ${fmt.money(rate, true).replace(' Cr', '')}/h` : '';
+    u.rate.className = `rate mono ${rate >= 0 ? 'pos' : 'neg'}`;
     u.pax.textContent = fmt.int(g.stats.delivered);
     u.trains.textContent = String(g.trains.size);
     u.ontime.textContent = `${fmt.int(g.stats.onTimeArrivals)}/${fmt.int(g.stats.arrivals)}`;
 
-    // event chips
-    const chipKey = g.events.map((e) => e.title + e.endsAt).join('|');
+    // event chips, plus research and works in progress
+    const ra = g.research.active;
+    const works = [...g.net.edges.values()].filter((e) => e.works).length;
+    const rPct = ra ? Math.floor(((g.time - ra.start) / (ra.end - ra.start)) * 20) * 5 : 0;
+    const chipKey = g.events.map((e) => e.title + e.endsAt).join('|') + `|${ra?.id}:${rPct}|${works}`;
     if (u.chips.dataset.key !== chipKey) {
       u.chips.dataset.key = chipKey;
-      u.chips.replaceChildren(...g.events.map((e) => h('div', { class: 'chip shadow', title: e.detail }, h('i'), e.title)));
+      const chips = g.events.map((e) => h('div', { class: 'chip shadow', title: e.detail }, h('i'), e.title));
+      if (ra) chips.push(h('div', { class: 'chip info shadow', title: 'Open research (R)', onclick: () => this.togglePanel('research') }, h('i'), `${RESEARCH_BY_ID.get(ra.id)!.name} · ${rPct}%`));
+      if (works) chips.push(h('div', { class: 'chip works shadow' }, h('i'), `${works} line${works > 1 ? 's' : ''} under works`));
+      u.chips.replaceChildren(...chips);
     }
 
     // feed

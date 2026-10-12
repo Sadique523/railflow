@@ -1,17 +1,38 @@
 import { CITIES, city } from '../data/cities';
-import { TRAIN_TYPE_BY_ID, trainCost } from '../data/trainTypes';
+import { PAX_CLASSES, PAX_CLASS_INFO, PaxClass, TRAIN_TYPE_BY_ID, trainCost } from '../data/trainTypes';
 import {
-  MAX_TRACK_KM, Network, distance, doubleCost, edgeId, km, trackCost,
+  DOUBLING_KM_PER_DAY, RESEARCH_BY_ID, lineClass, nextLineClass,
+} from '../data/research';
+import {
+  MAX_TRACK_KM, Network, TrackEdge, distance, doubleCost, edgeId, km, liveTracks, trackCost,
 } from './network';
 import { ON_TIME_MIN, PaxGroup, Segment, Train, TrainConfig } from './train';
+import { Flow, Ledger } from './ledger';
 
 export const START_FUNDS = 600;
 const FARE_PER_PAX_KM = 0.00003; // ₹ Cr
-const DEMAND_PER_HOUR = 3.2; // passengers/hour per sqrt(M·M) of population
+const DEMAND_PER_HOUR = 9; // passengers/hour per sqrt(M·M) of population, all classes, before service quality
+/** How strongly each class responds to service speed (door-to-door km/h). */
+const SPEED_ELASTICITY: Record<PaxClass, number> = { general: 0.3, ac: 0.8, premium: 1.4 };
+const REFERENCE_KMH = 70;
+/** How much crowding bothers each class. */
+const CROWD_TOLERANCE: Record<PaxClass, number> = { general: 0.4, ac: 1, premium: 1.5 };
 const GIVE_UP_MIN = 6 * 60;
 const MAX_WAITING_PER_DEST = 1500;
 const HEADWAY = 2.5;
 const SAVE_KEY = 'railflow-save-v1';
+
+/** 0, ½, ¼, ¾, ⅛ … (van der Corput): evenly fills a cycle however many trains join it. */
+function spread(k: number): number {
+  let f = 0;
+  let base = 0.5;
+  for (let n = k; n > 0; n >>= 1, base /= 2) if (n & 1) f += base;
+  return f;
+}
+
+function fmtWhen(min: number): string {
+  return `Day ${Math.floor(min / 1440) + 1} ${fmtClock(min)}`;
+}
 
 function fmtClock(min: number): string {
   const m = Math.floor(min) % 1440;
@@ -25,7 +46,7 @@ export interface Station {
   demandMult: number;
 }
 
-export type EventKind = 'fog' | 'monsoon' | 'signal' | 'festival';
+export type EventKind = 'fog' | 'monsoon' | 'signal' | 'festival' | 'incident';
 
 export interface GameEvent {
   kind: EventKind;
@@ -41,6 +62,27 @@ export interface LogEntry {
   time: number;
   text: string;
   tone: 'info' | 'good' | 'bad';
+}
+
+/** Fares collected by one train at one stop, for the on-map popups. */
+export interface Payout {
+  trainId: string;
+  cityId: string;
+  amount: number;
+}
+
+/** One class of passengers between two stations, and the service they get. */
+interface ServedPair {
+  o: string;
+  d: string;
+  cls: PaxClass;
+  trains: number;
+  kmh: number; // best door-to-door speed among trains they can take
+}
+
+export interface ResearchState {
+  done: Set<string>;
+  active: { id: string; start: number; end: number } | null;
 }
 
 export interface Stats {
@@ -62,11 +104,15 @@ export class Game {
   stats: Stats = { delivered: 0, gaveUp: 0, arrivals: 0, onTimeArrivals: 0, revenue: 0, costs: 0 };
   events: GameEvent[] = [];
   log: LogEntry[] = [];
+  ledger = new Ledger(this.time);
+  /** Unread payouts; the UI drains this. */
+  payouts: Payout[] = [];
   /** Exponentially-decayed happiness accumulator. */
   private hSum = 75 * 40;
   private hW = 40;
   private recentArrivals: boolean[] = [];
-  private servedPairs: [string, string][] = [];
+  private servedPairs: ServedPair[] = [];
+  research: ResearchState = { done: new Set(), active: null };
   private nextTrainNum = 1;
   private nextEventAt = this.time + 20 * 60;
   private logId = 0;
@@ -113,6 +159,15 @@ export class Game {
     this.hW += weight;
   }
 
+  /** The only place funds change. Income is positive, spending negative. */
+  private book(flow: Flow, amount: number, train?: Train) {
+    this.funds += amount;
+    if (flow === 'fares') this.stats.revenue += amount;
+    else if (amount < 0) this.stats.costs -= amount;
+    this.ledger.add(flow, amount, this.time);
+    train?.money.add(flow, amount, this.time);
+  }
+
   private notify(text: string, tone: LogEntry['tone'] = 'info') {
     this.log.push({ id: ++this.logId, time: this.time, text, tone });
     if (this.log.length > 60) this.log.shift();
@@ -132,8 +187,7 @@ export class Game {
   buildTrack(a: string, b: string): boolean {
     const chk = this.canBuildTrack(a, b);
     if (!chk.ok) return false;
-    this.funds -= chk.cost;
-    this.stats.costs += chk.cost;
+    this.book('track', -chk.cost);
     this.net.addEdge(a, b);
     this.version++;
     this.notify(`Track laid: ${city(a).name} – ${city(b).name} (${Math.round(km(distance(a, b)))} km)`);
@@ -141,22 +195,20 @@ export class Game {
   }
 
   upgradeTrack(id: string): boolean {
-    const e = this.net.edges.get(id);
-    if (!e || e.tracks === 2) return false;
-    const cost = doubleCost(e);
-    if (cost > this.funds) return false;
-    this.funds -= cost;
-    this.stats.costs += cost;
-    e.tracks = 2;
+    const info = this.doubleInfo(id);
+    if (!info.ok) return false;
+    const e = this.net.edges.get(id)!;
+    this.book('track', -info.cost!);
+    e.works = { kind: 'double', start: this.time, end: this.time + info.hours! * 60 };
     this.version++;
-    this.notify(`Line doubled: ${city(e.a).name} – ${city(e.b).name}`, 'good');
+    this.notify(`Doubling works begin: ${city(e.a).name} – ${city(e.b).name}. ${this.worksImpact(e)}`, 'bad');
     return true;
   }
 
   trainsUsingEdge(id: string): Train[] {
     const out: Train[] = [];
     for (const t of this.trains.values()) {
-      const route = this.net.routePath(t.cfg.stops) ?? [];
+      const route = this.net.routePath(t.cfg.stops, t.type.needsLineKmh ?? 0) ?? [];
       const uses = (p: string[]) => p.some((n, i) => i > 0 && edgeId(p[i - 1], n) === id);
       if (uses(t.path) || uses(route)) out.push(t);
     }
@@ -167,19 +219,131 @@ export class Game {
     const e = this.net.edges.get(id);
     if (!e || this.trainsUsingEdge(id).length) return false;
     this.net.removeEdge(id);
-    this.funds += trackCost(e.a, e.b) * 0.25;
+    this.book('sales', trackCost(e.a, e.b) * 0.25);
     this.version++;
     this.notify(`Track removed: ${city(e.a).name} – ${city(e.b).name}`);
     return true;
   }
 
-  routeInfo(stops: string[]): { ok: boolean; path?: string[]; length?: number; reason?: string } {
+  // ---------------------------------------------------------------- research
+
+  isResearched(id: string | undefined): boolean {
+    return !id || this.research.done.has(id);
+  }
+
+  canResearch(id: string): { ok: boolean; reason?: string } {
+    const r = RESEARCH_BY_ID.get(id);
+    if (!r) return { ok: false, reason: 'Unknown project' };
+    if (this.research.done.has(id)) return { ok: false, reason: 'Done' };
+    if (this.research.active) return { ok: false, reason: 'Another project is running' };
+    const missing = r.requires.filter((q) => !this.research.done.has(q));
+    if (missing.length) return { ok: false, reason: `Needs ${missing.map((q) => RESEARCH_BY_ID.get(q)!.name).join(' and ')}` };
+    if (r.cost > this.funds) return { ok: false, reason: 'Not enough funds' };
+    return { ok: true };
+  }
+
+  startResearch(id: string): boolean {
+    if (!this.canResearch(id).ok) return false;
+    const r = RESEARCH_BY_ID.get(id)!;
+    this.book('research', -r.cost);
+    this.research.active = { id, start: this.time, end: this.time + r.hours * 60 };
+    this.notify(`Research started: ${r.name}, ready ${fmtWhen(this.research.active.end)}`);
+    return true;
+  }
+
+  private updateResearch() {
+    const a = this.research.active;
+    if (!a || this.time < a.end) return;
+    this.research.done.add(a.id);
+    this.research.active = null;
+    const r = RESEARCH_BY_ID.get(a.id)!;
+    this.notify(`Research complete: ${r.name}. Unlocked ${r.unlocks}.`, 'good');
+    this.version++;
+  }
+
+  // ---------------------------------------------------------------- line works
+
+  /** Next speed upgrade for a line, if any, with its cost and length of works. */
+  upgradeInfo(id: string): { ok: boolean; toKmh?: number; cost?: number; hours?: number; reason?: string } {
+    const e = this.net.edges.get(id);
+    if (!e) return { ok: false, reason: 'No such line' };
+    const next = nextLineClass(e.kmh);
+    if (!next) return { ok: false, reason: 'Already at top speed' };
+    const cost = km(e.length) * next.costPerKm * (e.tracks === 2 ? 1.7 : 1);
+    const hours = Math.max(6, (km(e.length) / next.kmPerDay) * 24);
+    const base = { toKmh: next.kmh, cost, hours };
+    if (!this.isResearched(next.research)) return { ok: false, ...base, reason: `Research ${RESEARCH_BY_ID.get(next.research!)!.name}` };
+    if (e.works) return { ok: false, ...base, reason: 'Works already under way' };
+    if (cost > this.funds) return { ok: false, ...base, reason: 'Not enough funds' };
+    return { ok: true, ...base };
+  }
+
+  upgradeLine(id: string): boolean {
+    const info = this.upgradeInfo(id);
+    if (!info.ok) return false;
+    const e = this.net.edges.get(id)!;
+    this.book('track', -info.cost!);
+    e.works = { kind: 'upgrade', toKmh: info.toKmh, start: this.time, end: this.time + info.hours! * 60 };
+    this.version++;
+    this.notify(`Works begin: ${city(e.a).name} – ${city(e.b).name} to ${info.toKmh} km/h. ${this.worksImpact(e)}`, 'bad');
+    return true;
+  }
+
+  doubleInfo(id: string): { ok: boolean; cost?: number; hours?: number; reason?: string } {
+    const e = this.net.edges.get(id);
+    if (!e) return { ok: false, reason: 'No such line' };
+    if (e.tracks === 2) return { ok: false, reason: 'Already double' };
+    const cost = doubleCost(e) * (lineClass(e.kmh).costPerKm > 0 ? 1.3 : 1);
+    const hours = Math.max(6, (km(e.length) / DOUBLING_KM_PER_DAY) * 24);
+    if (e.works) return { ok: false, cost, hours, reason: 'Works already under way' };
+    if (cost > this.funds) return { ok: false, cost, hours, reason: 'Not enough funds' };
+    return { ok: true, cost, hours };
+  }
+
+  /** Trains on a line that could take another way round, for planning works. */
+  diversions(id: string): { users: Train[]; stuck: Train[] } {
+    const e = this.net.edges.get(id);
+    const users = this.trainsUsingEdge(id);
+    if (!e) return { users, stuck: [] };
+    const saved = e.kmh;
+    e.kmh = 0.001; // price the line out of the route search
+    const stuck = users.filter((t) => {
+      const p = this.net.routePath(t.cfg.stops, t.type.needsLineKmh ?? 0);
+      return !p || p.some((n, i) => i > 0 && edgeId(p[i - 1], n) === id);
+    });
+    e.kmh = saved;
+    return { users, stuck };
+  }
+
+  /** How works on a line will hit traffic, for the notice when they start. */
+  private worksImpact(e: TrackEdge): string {
+    const { users, stuck } = this.diversions(e.id);
+    if (!users.length) return 'No trains affected.';
+    if (stuck.length) return `${stuck.length} train${stuck.length > 1 ? 's have' : ' has'} no diversion and will crawl through the works.`;
+    const through = this.trainsUsingEdge(e.id).length;
+    return through ? `${through} train${through > 1 ? 's' : ''} will still run through; the way round is slower.` : `All ${users.length} affected trains divert.`;
+  }
+
+  private updateWorks() {
+    for (const e of this.net.edges.values()) {
+      const w = e.works;
+      if (!w || this.time < w.end) continue;
+      if (w.kind === 'upgrade') e.kmh = w.toKmh!;
+      else e.tracks = 2;
+      e.works = null;
+      this.version++;
+      this.notify(`Works complete: ${city(e.a).name} – ${city(e.b).name} ${w.kind === 'upgrade' ? `now ${e.kmh} km/h` : 'now double track'}`, 'good');
+    }
+  }
+
+  routeInfo(stops: string[], typeId?: string): { ok: boolean; path?: string[]; length?: number; reason?: string } {
     if (stops.length < 2) return { ok: false, reason: 'Add at least two stops' };
     for (let i = 1; i < stops.length; i++) {
       if (stops[i] === stops[i - 1]) return { ok: false, reason: 'Consecutive stops must differ' };
     }
-    const path = this.net.routePath(stops);
-    if (!path) return { ok: false, reason: 'Stops are not connected by track' };
+    const minKmh = (typeId && TRAIN_TYPE_BY_ID.get(typeId)?.needsLineKmh) || 0;
+    const path = this.net.routePath(stops, minKmh);
+    if (!path) return { ok: false, reason: minKmh ? `Needs ${minKmh} km/h high-speed line between every stop` : 'Stops are not connected by track' };
     return { ok: true, path, length: this.net.pathLength(path) };
   }
 
@@ -192,7 +356,8 @@ export class Game {
   addTrain(spec: Omit<TrainConfig, 'id' | 'number'> & { number?: string }): Train | string {
     const type = TRAIN_TYPE_BY_ID.get(spec.typeId);
     if (!type) return 'Unknown train type';
-    const route = this.routeInfo(spec.stops);
+    if (!this.isResearched(type.research)) return `Research ${RESEARCH_BY_ID.get(type.research!)!.name} first`;
+    const route = this.routeInfo(spec.stops, spec.typeId);
     if (!route.ok) return route.reason!;
     const cost = trainCost(type, spec.coaches);
     if (cost > this.funds) return 'Not enough funds';
@@ -203,11 +368,15 @@ export class Game {
     };
     this.nextTrainNum++;
     const t = new Train(cfg);
-    // stagger first departure to the next quarter hour
-    const dep = Math.ceil((this.time + 10) / 15) * 15;
+    t.money = new Ledger(this.time);
+    // first departure on the next quarter hour; trains added to an identical route are
+    // spread through its cycle (½, ¼, ¾ …) so they do not run in a bunch
+    const same = [...this.trains.values()].filter((o) => o.cfg.stops.join() === spec.stops.join()).length;
+    t.start(this.net, this.time, this.time);
+    const cycle = 2 * (t.journeyTime(this.net) + Train.TERMINAL_DWELL);
+    const dep = Math.ceil((this.time + 10 + cycle * spread(same)) / 15) * 15;
     t.start(this.net, this.time, dep);
-    this.funds -= cost;
-    this.stats.costs += cost;
+    this.book('trains', -cost, t);
     this.trains.set(cfg.id, t);
     this.refreshServedPairs();
     this.version++;
@@ -219,24 +388,39 @@ export class Game {
     const t = this.trains.get(id);
     if (!t) return;
     for (const e of this.net.edges.values()) e.occupants.delete(id);
-    this.funds += trainCost(t.type, t.cfg.coaches) * 0.4;
+    this.book('sales', trainCost(t.type, t.cfg.coaches) * 0.4);
     this.trains.delete(id);
     this.refreshServedPairs();
     this.version++;
     this.notify(`${t.cfg.number} withdrawn from service`);
   }
 
+  /** Which classes can travel between which stations, how often and how fast. */
   private refreshServedPairs() {
-    const set = new Set<string>();
-    this.servedPairs = [];
+    const by = new Map<string, ServedPair>();
     for (const t of this.trains.values()) {
       const s = t.cfg.stops;
-      for (const o of s) for (const d of s) {
-        if (o === d) continue;
-        const k = `${o}>${d}`;
-        if (!set.has(k)) { set.add(k); this.servedPairs.push([o, d]); }
+      for (const cls of PAX_CLASSES) {
+        if (!t.carries(cls)) continue;
+        for (const o of s) for (const d of s) {
+          if (o === d) continue;
+          const k = `${o}>${d}>${cls}`;
+          const p = by.get(k);
+          if (p) {
+            p.trains++;
+            p.kmh = Math.max(p.kmh, t.serviceKmh);
+          } else by.set(k, { o, d, cls, trains: 1, kmh: t.serviceKmh });
+        }
       }
     }
+    this.servedPairs = [...by.values()];
+  }
+
+  /** Passengers per hour a served pair generates, before time of day and events. */
+  pairDemand(p: { o: string; d: string; cls: PaxClass; trains: number; kmh: number }): number {
+    const speed = Math.pow(Math.max(0.4, p.kmh / REFERENCE_KMH), SPEED_ELASTICITY[p.cls]);
+    const freq = Math.pow(Math.min(6, p.trains), 0.45);
+    return DEMAND_PER_HOUR * Math.sqrt(city(p.o).pop * city(p.d).pop) * PAX_CLASS_INFO[p.cls].share * speed * freq;
   }
 
   // ---------------------------------------------------------------- simulation
@@ -255,10 +439,14 @@ export class Game {
     this.spawnPassengers(dt);
     for (const t of this.trains.values()) this.stepTrain(t, dt);
     this.chargeOperatingCosts(dt);
+    this.updateResearch();
+    this.updateWorks();
 
     const hour = Math.floor(this.time / 60);
     if (hour !== this.lastHour) {
       this.lastHour = hour;
+      // trains re-time at each reversal, so service speeds drift; refresh demand hourly
+      this.refreshServedPairs();
       // older happiness samples fade out
       this.hSum *= 0.9;
       this.hW *= 0.9;
@@ -271,41 +459,36 @@ export class Game {
   }
 
   private chargeOperatingCosts(dt: number) {
-    let c = 0;
-    for (const t of this.trains.values()) {
-      c += (t.type.opCostPerHour + t.type.opCostPerCoachHour * t.cfg.coaches) * (dt / 60);
-    }
-    this.funds -= c;
-    this.stats.costs += c;
+    for (const t of this.trains.values()) this.book('running', -t.runningCostPerHour * (dt / 60), t);
+    let upkeep = 0;
+    for (const e of this.net.edges.values()) upkeep += km(e.length) * lineClass(e.kmh).upkeepPerKmDay * (e.tracks === 2 ? 1.6 : 1);
+    if (upkeep) this.book('upkeep', -upkeep * (dt / 1440));
   }
 
   private spawnPassengers(dt: number) {
     if (!this.servedPairs.length) return;
     const hourOfDay = (this.time / 60) % 24;
     const tod = hourOfDay < 5 ? 0.35 : hourOfDay < 7 ? 0.8 : hourOfDay > 22 ? 0.5 : 1;
-    for (const [o, d] of this.servedPairs) {
+    for (const p of this.servedPairs) {
+      const { o, d, cls } = p;
       const so = this.stations.get(o)!;
       const sd = this.stations.get(d)!;
-      const rate = (DEMAND_PER_HOUR * Math.sqrt(city(o).pop * city(d).pop) / 60) * tod * so.demandMult * sd.demandMult;
-      const acc = (so.acc.get(d) ?? 0) + rate * dt;
+      const rate = (this.pairDemand(p) / 60) * tod * so.demandMult * sd.demandMult;
+      const key = `${d}|${cls}`;
+      const acc = (so.acc.get(key) ?? 0) + rate * dt;
       const n = Math.floor(acc);
-      so.acc.set(d, acc - n);
+      so.acc.set(key, acc - n);
       if (n <= 0) continue;
-      const last = so.waiting.length ? so.waiting[so.waiting.length - 1] : undefined;
-      if (last && last.dest === d && this.time - last.spawn < 20) {
-        last.count += n;
-        continue;
-      }
       let existing = 0;
-      for (const g of so.waiting) if (g.dest === d) existing += g.count;
-      if (existing > MAX_WAITING_PER_DEST) continue;
-      // merge into a recent group for the same destination
+      for (const g of so.waiting) if (g.dest === d && g.cls === cls) existing += g.count;
+      if (existing > MAX_WAITING_PER_DEST * PAX_CLASS_INFO[cls].share) continue;
+      // merge into a recent group for the same destination and class
       let merged = false;
       for (let i = so.waiting.length - 1; i >= 0 && i >= so.waiting.length - 40; i--) {
         const g = so.waiting[i];
-        if (g.dest === d && this.time - g.spawn < 20) { g.count += n; merged = true; break; }
+        if (g.dest === d && g.cls === cls && this.time - g.spawn < 20) { g.count += n; merged = true; break; }
       }
-      if (!merged) so.waiting.push({ origin: o, dest: d, count: n, spawn: this.time, boarded: 0, loadAtBoard: 0 });
+      if (!merged) so.waiting.push({ cls, origin: o, dest: d, count: n, spawn: this.time, boarded: 0, loadAtBoard: 0 });
     }
   }
 
@@ -336,7 +519,7 @@ export class Game {
   private canEnter(s: Segment, t: Train): boolean {
     for (const [id, o] of s.edge.occupants) {
       if (id === t.cfg.id || o.block !== s.block) continue;
-      if (s.edge.tracks === 1) return false;
+      if (liveTracks(s.edge) === 1) return false;
       if (o.dir !== s.dir) continue;
       const other = this.trains.get(id);
       if (!other) continue;
@@ -360,13 +543,6 @@ export class Game {
 
   private stepTrain(t: Train, dt: number) {
     if (t.state === 'dwelling') {
-      // at a terminal the rake rolls clear of the junction into the platform road
-      if (t.pos < t.rollTo) {
-        const rem = t.rollTo - t.pos;
-        t.v = Math.max(t.length / 8, Math.min(t.v, Math.sqrt(2 * t.decel * rem)));
-        t.pos = Math.min(t.rollTo, t.pos + t.v * dt);
-        if (t.pos < t.rollTo) return;
-      }
       t.v = 0;
       if (this.time < t.dwellUntil) return;
       this.depart(t);
@@ -383,15 +559,14 @@ export class Game {
 
     const stopNode = t.stopIdx[t.nextStop];
     const terminal = t.nextStop === t.stopIdx.length - 1;
-    const stopTarget = terminal ? t.totalLen + t.length : t.cum[stopNode];
-    // a terminal counts as reached when the head arrives; the train then rolls on into the siding
-    const arriveAt = terminal ? t.totalLen : stopTarget;
-    let target = stopTarget;
-    let speedFactor = 1;
+    // every stop, terminals included, is reached when the head draws up at the station
+    const arriveAt = t.cum[stopNode];
+    let target = arriveAt;
+    let vmax = t.cruise;
 
     if (t.onSeg) {
       const s = t.segs[t.seg];
-      speedFactor = s.edge.speedFactor;
+      vmax = t.vmaxOn(s.edge) * s.edge.speedFactor;
       // signal at the end of this block (loop or pass-through station)
       const ns = t.segs[t.seg + 1];
       if (ns && !(ns.block === 0 && ns.node === stopNode)) {
@@ -399,7 +574,7 @@ export class Game {
         if (s.end - t.pos <= brake && !this.canEnter(ns, t)) target = Math.min(target, s.end);
       }
       // keep distance behind a train ahead in the same block on double track
-      if (s.edge.tracks === 2) {
+      if (liveTracks(s.edge) === 2) {
         const mine = t.pos - s.start;
         for (const [id, o] of s.edge.occupants) {
           if (id === t.cfg.id || o.dir !== s.dir || o.block !== s.block) continue;
@@ -410,7 +585,6 @@ export class Game {
       }
     }
 
-    const vmax = t.cruise * speedFactor;
     const remaining = target - t.pos;
     const vBrake = Math.sqrt(2 * t.decel * Math.max(0, remaining));
     t.v = Math.max(0, Math.min(t.v + t.accel * dt, vmax, vBrake));
@@ -437,8 +611,7 @@ export class Game {
 
   private arrive(t: Train, terminal: boolean) {
     const stopId = t.path[t.stopIdx[t.nextStop]];
-    if (terminal) t.rollTo = t.totalLen + t.length;
-    else t.v = 0;
+    t.v = 0;
     t.state = 'dwelling';
     const delay = Math.max(0, this.time - t.schedArr);
     t.delay = delay;
@@ -451,11 +624,21 @@ export class Game {
 
     // alight
     const keep: PaxGroup[] = [];
+    let fares = 0;
     for (const g of t.passengers) {
-      if (g.dest === stopId) this.deliver(t, g, delay);
+      if (g.dest === stopId) fares += this.deliver(t, g, delay);
       else keep.push(g);
     }
     t.passengers = keep;
+    t.tripFares += fares;
+    if (fares > 0) {
+      this.payouts.push({ trainId: t.cfg.id, cityId: stopId, amount: fares });
+      if (this.payouts.length > 40) this.payouts.shift();
+    }
+    if (terminal) {
+      t.lastTripFares = t.tripFares;
+      t.tripFares = 0;
+    }
 
     const planned = terminal ? Train.TERMINAL_DWELL : Train.INTERMEDIATE_DWELL;
     const min = terminal ? Train.MIN_TERMINAL_DWELL : Train.MIN_INTERMEDIATE_DWELL;
@@ -480,10 +663,7 @@ export class Game {
         t.dwellUntil = this.time + 30;
         return;
       }
-      t.pos = 0;
-      t.rollTo = 0;
-      t.seg = 0;
-      t.onSeg = false;
+      t.placeAtOrigin();
       t.nextStop = 1;
       t.tripStartedAt = this.time;
     }
@@ -491,8 +671,7 @@ export class Game {
     this.board(t, here);
     const lf = t.load / t.seats;
     for (const g of t.passengers) g.loadAtBoard = Math.max(g.loadAtBoard, lf);
-    const legLen = t.cum[t.stopIdx[t.nextStop]] - t.cum[t.stopIdx[t.nextStop - 1]];
-    t.schedArr = t.schedDep + t.plannedTravel(legLen);
+    t.schedArr = t.schedDep + t.legTime(this.net, t.stopIdx[t.nextStop - 1], t.stopIdx[t.nextStop]);
     t.state = 'running';
   }
 
@@ -505,7 +684,7 @@ export class Game {
     if (free <= 0) return;
     const keep: PaxGroup[] = [];
     for (const g of st.waiting) {
-      if (free > 0 && ahead.has(g.dest)) {
+      if (free > 0 && ahead.has(g.dest) && t.carries(g.cls)) {
         const n = Math.min(free, g.count);
         free -= n;
         t.passengers.push({ ...g, count: n, boarded: this.time, loadAtBoard: 0 });
@@ -515,20 +694,21 @@ export class Game {
     st.waiting = keep;
   }
 
-  private deliver(t: Train, g: PaxGroup, delay: number) {
+  /** Hand a group over at its destination; returns the fares it paid. */
+  private deliver(t: Train, g: PaxGroup, delay: number): number {
     const wait = g.boarded - g.spawn;
     const distKm = km(distance(g.origin, g.dest)) * 1.15;
     const waitPen = Math.min(30, Math.max(0, (wait - 30) / 6));
     const delayPen = Math.min(40, Math.max(0, (delay - ON_TIME_MIN) / 2));
-    const crowdPen = Math.min(35, Math.max(0, (g.loadAtBoard - 1) * 60));
+    const crowdPen = Math.min(35, Math.max(0, (g.loadAtBoard - 1) * 60 * CROWD_TOLERANCE[g.cls]));
     const onTime = delay <= ON_TIME_MIN;
     const h = Math.max(0, Math.min(100, 70 + t.type.comfort - waitPen - delayPen - crowdPen + (onTime ? 10 : 0)));
     this.recordHappiness(h, Math.min(g.count, 400));
-    const revenue = g.count * distKm * t.type.fareMult * FARE_PER_PAX_KM;
-    this.funds += revenue;
-    this.stats.revenue += revenue;
+    const revenue = g.count * distKm * (t.type.fares[g.cls] ?? 1) * FARE_PER_PAX_KM;
+    this.book('fares', revenue, t);
     this.stats.delivered += g.count;
     this.score += Math.round(g.count * (distKm / 100) * (h / 100) * (onTime ? 1.25 : 1));
+    return revenue;
   }
 
   // ---------------------------------------------------------------- events
@@ -559,6 +739,16 @@ export class Game {
   private rollEvent(): GameEvent | null {
     const r = Math.random();
     const edges = [...this.net.edges.values()];
+    // fast lines without automatic train protection see signal incidents
+    const unsafe = this.research.done.has('kavach') ? [] : edges.filter((e) => e.kmh > 110);
+    if (unsafe.length && Math.random() < 0.45) {
+      const e = unsafe[Math.floor(Math.random() * unsafe.length)];
+      this.recordHappiness(20, 120);
+      return {
+        kind: 'incident', title: 'Signal passed at danger', detail: `${city(e.a).name} – ${city(e.b).name} near miss, line held for inquiry. Kavach prevents this.`,
+        endsAt: this.time + 5 * 60, edgeId: e.id,
+      };
+    }
     if (r < 0.3) {
       return { kind: 'fog', title: 'Dense fog over North India', detail: 'line speed cut north of 24°N', endsAt: this.time + 8 * 60 };
     }
@@ -572,7 +762,7 @@ export class Game {
         endsAt: this.time + 3 * 60, edgeId: e.id,
       };
     }
-    const served = [...new Set(this.servedPairs.map((p) => p[0]))];
+    const served = [...new Set(this.servedPairs.map((p) => p.o))];
     if (!served.length) return null;
     const c = served[Math.floor(Math.random() * served.length)];
     const fest = ['Diwali', 'Durga Puja', 'Holi', 'Pongal', 'Onam', 'Ganesh Chaturthi', 'Chhath'][Math.floor(Math.random() * 7)];
@@ -591,6 +781,7 @@ export class Game {
         if (ev.kind === 'fog' && a.lat >= 24 && b.lat >= 24) f = Math.min(f, 0.55);
         if (ev.kind === 'monsoon' && a.lon < 77.5 && b.lon < 77.5 && a.lat < 21.5 && b.lat < 21.5) f = Math.min(f, 0.7);
         if (ev.kind === 'signal' && ev.edgeId === e.id) f = Math.min(f, 0.25);
+        if (ev.kind === 'incident' && ev.edgeId === e.id) f = Math.min(f, 0.1);
       }
       e.speedFactor = f;
     }
@@ -612,8 +803,11 @@ export class Game {
       hW: this.hW,
       recent: this.recentArrivals,
       nextTrainNum: this.nextTrainNum,
-      edges: [...this.net.edges.values()].map((e) => [e.a, e.b, e.tracks]),
+      edges: [...this.net.edges.values()].map((e) => [e.a, e.b, e.tracks, e.kmh, e.works]),
+      research: { done: [...this.research.done], active: this.research.active },
       trains: [...this.trains.values()].map((t) => t.cfg),
+      ledger: this.ledger.toJSON(),
+      trainMoney: Object.fromEntries([...this.trains.values()].map((t) => [t.cfg.id, { ledger: t.money.toJSON(), lastTrip: t.lastTripFares }])),
     };
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify(data));
@@ -644,9 +838,14 @@ export class Game {
       g.nextTrainNum = d.nextTrainNum;
       g.lastHour = Math.floor(g.time / 60);
       g.nextEventAt = g.time + 12 * 60;
-      for (const [a, b, tracks] of d.edges) g.net.addEdge(a, b, tracks);
+      g.ledger = Ledger.from(d.ledger, g.time);
+      for (const [a, b, tracks, kmh, works] of d.edges) g.net.addEdge(a, b, tracks, kmh ?? 110).works = works ?? null;
+      g.research = { done: new Set(d.research?.done ?? []), active: d.research?.active ?? null };
       for (const cfg of d.trains as TrainConfig[]) {
         const t = new Train(cfg);
+        const money = d.trainMoney?.[cfg.id];
+        t.money = Ledger.from(money?.ledger, g.time);
+        t.lastTripFares = money?.lastTrip ?? null;
         if (t.start(g.net, g.time, Math.ceil((g.time + 5) / 15) * 15)) g.trains.set(cfg.id, t);
       }
       g.refreshServedPairs();

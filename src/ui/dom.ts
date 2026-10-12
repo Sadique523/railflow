@@ -34,6 +34,12 @@ export function svg(markup: string): SVGElement {
 export const fmt = {
   int: (n: number) => Math.round(n).toLocaleString('en-IN'),
   cr: (n: number) => `₹${n < 0 ? '-' : ''}${Math.abs(n) >= 100 ? Math.round(Math.abs(n)).toLocaleString('en-IN') : Math.abs(n).toFixed(1)} Cr`,
+  /** Finer-grained crore amounts for the money views; `sign` adds a leading + to income. */
+  money: (n: number, sign = false) => {
+    const a = Math.abs(n);
+    const v = a >= 100 ? Math.round(a).toLocaleString('en-IN') : a >= 10 ? a.toFixed(1) : a.toFixed(2);
+    return `${n < 0 ? '−' : sign && n > 0 ? '+' : ''}₹${v} Cr`;
+  },
   clock: (min: number) => {
     const m = Math.floor(min) % 1440;
     return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;

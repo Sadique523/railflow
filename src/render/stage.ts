@@ -38,7 +38,9 @@ export class Stage {
     this.labels.domElement.className = 'label-layer';
     container.appendChild(this.labels.domElement);
 
-    this.scene.background = new THREE.Color(COLORS.sea);
+    // the world runs on to the horizon and fades into haze, so there is no edge to see
+    this.scene.background = new THREE.Color(COLORS.haze);
+    this.scene.fog = new THREE.Fog(COLORS.haze, 1000, 3000);
 
     this.camera = new THREE.PerspectiveCamera(38, w / h, 1, 4000);
     this.camera.position.set(0, 160, 110);
@@ -149,7 +151,19 @@ export class Stage {
       t.x += cx; t.z += cz;
       this.camera.position.x += cx; this.camera.position.z += cz;
     }
+    // the further out, the less the camera may tilt, so the view stays on the map
+    const far = THREE.MathUtils.smoothstep(this.distance, 350, 1000);
+    this.controls.maxPolarAngle = THREE.MathUtils.lerp(1.05, 0.6, far);
     this.controls.update();
+
+    const fog = this.scene.fog as THREE.Fog;
+    fog.near = this.distance * 1.2;
+    fog.far = this.distance * 2.6;
+    const camFar = Math.max(4000, fog.far * 1.2);
+    if (this.camera.far !== camFar) {
+      this.camera.far = camFar;
+      this.camera.updateProjectionMatrix();
+    }
 
     // the sun follows the view so shadows stay crisp
     const d = this.distance;

@@ -4,6 +4,7 @@ import { CAR } from '../data/trainTypes';
 import { BOX, COLORS } from './palette';
 import { GeoBuilder, PRIM, VCOL } from './batch';
 import { PAL } from './models';
+import { lineClass } from '../data/research';
 import type { Game } from '../sim/game';
 import type { TrackEdge } from '../sim/network';
 
@@ -70,6 +71,34 @@ function platform(b: GeoBuilder, x: number, z0: number, z1: number, side: 1 | -1
   }
 }
 
+/**
+ * Covered train shed over the platform roads: portal frames with a shallow gable,
+ * roofed in panels with open skylight strips so the trains stay visible from above.
+ */
+function trainShed(b: GeoBuilder, x0: number, x1: number, z0: number, z1: number) {
+  const xc = (x0 + x1) / 2;
+  const half = (x1 - x0) / 2;
+  const eave = 1.75;
+  const rise = 0.45;
+  const slope = Math.atan2(rise, half);
+  const rafter = Math.hypot(half, rise);
+  const bays = Math.max(2, Math.round((z1 - z0) / 1.8));
+  const step = (z1 - z0) / bays;
+  for (let i = 0; i <= bays; i++) {
+    const z = z0 + i * step;
+    for (const x of [x0, x1]) b.block(PAL.dark, x, 0.08, z, 0.1, eave - 0.08, 0.1);
+    for (const s of [-1, 1]) b.box(PAL.dark, xc + (s * half) / 2, eave + rise / 2, z, rafter, 0.08, 0.08, 0, 0, -s * slope);
+  }
+  for (let i = 0; i < bays; i++) {
+    const z = z0 + (i + 0.5) * step;
+    for (const s of [-1, 1]) {
+      b.box(PAL.wall2, xc + (s * half) / 2, eave + rise / 2 + 0.07, z, rafter + 0.2, 0.05, step * 0.62, 0, 0, -s * slope);
+    }
+  }
+  b.box(PAL.dark, xc, eave + rise + 0.05, (z0 + z1) / 2, 0.12, 0.08, z1 - z0);
+  for (const x of [x0, x1]) b.box(PAL.roofBlue, x, eave, (z0 + z1) / 2, 0.14, 0.12, z1 - z0);
+}
+
 function buildEdgeGeometry(e: TrackEdge): { geo: THREE.BufferGeometry; len: number } {
   const a = city(e.a);
   const bc = city(e.b);
@@ -81,13 +110,14 @@ function buildEdgeGeometry(e: TrackEdge): { geo: THREE.BufferGeometry; len: numb
   const b = new GeoBuilder();
   const fw = formationWidth(e.tracks);
   const lanes = e.tracks === 2 ? [-CAR.lane, CAR.lane] : [0];
+  const bed = lineClass(e.kmh).color;
 
-  b.box(PAL.formation, 0, 0.04, 0, fw, 0.08, len);
+  b.box(bed, 0, 0.04, 0, fw, 0.08, len);
   for (const lx of lanes) lane(b, lx, z0, z1);
 
-  // overhead electrification, kept out of the station areas
-  const wz0 = z0 + halfA + 1;
-  const wz1 = z1 - halfB - 1;
+  // overhead electrification, kept out of the station areas and their sheds
+  const wz0 = z0 + halfA + 3.5;
+  const wz1 = z1 - halfB - 3.5;
   if (wz1 - wz0 > 2) {
     const masts = Math.max(2, Math.round((wz1 - wz0) / MAST_STEP) + 1);
     const sides = e.tracks === 2 ? [-1, 1] : [1];
@@ -110,7 +140,7 @@ function buildEdgeGeometry(e: TrackEdge): { geo: THREE.BufferGeometry; len: numb
   if (e.tracks === 1) {
     for (let j = 1; j < e.blocks; j++) {
       const z = z0 + (j * len) / e.blocks;
-      b.box(PAL.formation, LOOP_X / 2, 0.04, z, Math.abs(LOOP_X) + fw, 0.08, LOOP_LEN + 4);
+      b.box(bed, LOOP_X / 2, 0.04, z, Math.abs(LOOP_X) + fw, 0.08, LOOP_LEN + 4);
       lane(b, LOOP_X, z - LOOP_LEN / 2, z + LOOP_LEN / 2);
       diagonal(b, 0, z - LOOP_LEN / 2 - 1.6, LOOP_X, z - LOOP_LEN / 2);
       diagonal(b, LOOP_X, z + LOOP_LEN / 2, 0, z + LOOP_LEN / 2 + 1.6);
@@ -134,14 +164,41 @@ function buildEdgeGeometry(e: TrackEdge): { geo: THREE.BufferGeometry; len: numb
     const pz1 = end < 0 ? z0 + d1 : z1 - d0;
     platform(b, px, pz0, pz1, 1);
     if (e.tracks === 2) platform(b, -px, pz0, pz1, -1);
+    trainShed(b, e.tracks === 2 ? -px - 0.7 : -0.95, px + 0.7, pz0 - 0.4, pz1 + 0.4);
   }
+  if (e.works) worksSite(b, e.works.kind, fw, z0 + halfA + 4, z1 - halfB - 4);
   return { geo: b.build(), len };
+}
+
+/** Barriers along the line and work machines dotted along it. */
+function worksSite(b: GeoBuilder, kind: 'upgrade' | 'double', fw: number, z0: number, z1: number) {
+  if (z1 - z0 < 4) return;
+  const side = fw / 2 + 0.35;
+  if (kind === 'double') {
+    // the new formation being laid alongside
+    b.box(PAL.ballast, side + 0.55, 0.05, (z0 + z1) / 2, 1.1, 0.1, z1 - z0);
+  }
+  const n = Math.max(2, Math.floor((z1 - z0) / 2.4));
+  for (let i = 0; i <= n; i++) {
+    const z = z0 + ((z1 - z0) * i) / n;
+    for (const x of [-side, side + (kind === 'double' ? 1.2 : 0)]) {
+      b.block(i % 2 ? PAL.dark : PAL.yellow, x, 0.08, z, 0.12, 0.32, 0.9);
+    }
+  }
+  const machines = Math.max(1, Math.floor((z1 - z0) / 26));
+  for (let i = 0; i < machines; i++) {
+    const z = z0 + ((z1 - z0) * (i + 0.5)) / machines;
+    const x = side + 0.7;
+    b.block(PAL.yellow, x, 0.08, z, 0.7, 0.42, 1.5);
+    b.block(PAL.dark, x, 0.5, z - 0.35, 0.55, 0.32, 0.5);
+    b.box(PAL.yellow, x - 0.35, 0.95, z + 0.2, 0.08, 0.08, 1.3, 0, 0.6);
+  }
 }
 
 /** Track meshes, rebuilt per edge when the network changes. */
 export class TrackView {
   group = new THREE.Group();
-  private views = new Map<string, { tracks: number; mesh: THREE.Mesh }>();
+  private views = new Map<string, { key: string; mesh: THREE.Mesh }>();
   private ghost: THREE.Mesh;
   private highlight = new THREE.Group();
 
@@ -156,9 +213,10 @@ export class TrackView {
   }
 
   sync(game: Game) {
+    const keyOf = (e: TrackEdge) => `${e.tracks}|${e.kmh}|${e.works?.kind ?? ''}`;
     for (const [id, v] of this.views) {
       const e = game.net.edges.get(id);
-      if (!e || e.tracks !== v.tracks) {
+      if (!e || keyOf(e) !== v.key) {
         this.group.remove(v.mesh);
         v.mesh.geometry.dispose();
         this.views.delete(id);
@@ -174,7 +232,7 @@ export class TrackView {
       mesh.rotation.y = Math.atan2(b.x - a.x, b.z - a.z);
       mesh.castShadow = mesh.receiveShadow = true;
       this.group.add(mesh);
-      this.views.set(e.id, { tracks: e.tracks, mesh });
+      this.views.set(e.id, { key: keyOf(e), mesh });
     }
   }
 

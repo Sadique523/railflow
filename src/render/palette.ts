@@ -2,6 +2,7 @@ import * as THREE from 'three';
 
 export const COLORS = {
   sea: 0x22336f,
+  haze: 0x2c3c78,
   land: 0xe4e6ec,
   building: 0xf3f4f7,
   plaza: 0x3d63d6,

@@ -1,11 +1,12 @@
 import * as THREE from 'three';
 import { CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 import { CITIES, City, plazaSize } from '../data/cities';
-import { MAINLAND, SRI_LANKA, onLand, toXZ } from '../data/geo';
+import { onLand } from '../data/geo';
 import { BOX, COLORS, mat, rng } from './palette';
 import { GeoBuilder, VCOL } from './batch';
 import { HOUSES, HouseKind, PAL, PERSON, stationGeometry } from './models';
 import { formationWidth } from './tracks';
+import { buildTerrain, TerrainUniforms } from './terrain';
 import type { Game } from '../sim/game';
 
 interface Placed {
@@ -74,36 +75,15 @@ export class World {
   private detail = true;
   private bracket: THREE.Group;
   private selectBracket: THREE.Group;
+  private terrain: TerrainUniforms;
 
   constructor(scene: THREE.Scene) {
     scene.add(this.group);
-    this.buildLand();
+    this.terrain = buildTerrain(this.group);
     this.buildCities();
     this.bracket = this.makeBracket(COLORS.white);
     this.selectBracket = this.makeBracket(COLORS.yellow);
     this.group.add(this.bracket, this.selectBracket);
-  }
-
-  private buildLand() {
-    const tex = gridTexture();
-    const top = new THREE.MeshLambertMaterial({ color: 0xffffff, map: tex });
-    const side = mat(0xc9cedb);
-    for (const poly of [MAINLAND, SRI_LANKA]) {
-      const pts = toXZ(poly).map((p) => new THREE.Vector2(p.x, -p.z));
-      const shape = new THREE.Shape(pts);
-      const geo = new THREE.ExtrudeGeometry(shape, { depth: 3, bevelEnabled: false });
-      geo.rotateX(-Math.PI / 2);
-      geo.translate(0, -3, 0);
-      const mesh = new THREE.Mesh(geo, [top, side]);
-      mesh.receiveShadow = true;
-      this.group.add(mesh);
-    }
-    // the sea floor sits below the land plate
-    const sea = new THREE.Mesh(new THREE.PlaneGeometry(5000, 5000), mat(COLORS.sea));
-    sea.rotation.x = -Math.PI / 2;
-    sea.position.y = -2.2;
-    sea.receiveShadow = true;
-    this.group.add(sea);
   }
 
   private buildStation(c: City, s: number, r: () => number): StationView {
@@ -371,6 +351,8 @@ export class World {
   update(game: Game, camDistance: number, highlight: Set<string>) {
     // small props are sub-pixel from far away; skip drawing them
     const detail = camDistance < 420;
+    // the tile grid only reads up close; further out it turns to noise
+    this.terrain.uGrid.value = THREE.MathUtils.clamp((420 - camDistance) / 220, 0, 1);
     if (detail !== this.detail) {
       this.detail = detail;
       for (const [key, m] of this.houseMeshes) if (SMALL_PROPS.has(key.split('|')[1])) m.visible = detail;
@@ -417,29 +399,6 @@ export function segDist(px: number, pz: number, ax: number, az: number, bx: numb
   let t = l2 ? ((px - ax) * dx + (pz - az) * dz) / l2 : 0;
   t = Math.max(0, Math.min(1, t));
   return Math.hypot(px - (ax + dx * t), pz - (az + dz * t));
-}
-
-function gridTexture(): THREE.Texture {
-  const c = document.createElement('canvas');
-  c.width = c.height = 256;
-  const g = c.getContext('2d')!;
-  g.fillStyle = '#e4e6ec';
-  g.fillRect(0, 0, 256, 256);
-  g.strokeStyle = 'rgba(160,168,190,0.35)';
-  g.lineWidth = 2;
-  g.strokeRect(0, 0, 256, 256);
-  g.strokeStyle = 'rgba(160,168,190,0.16)';
-  g.lineWidth = 1;
-  g.beginPath();
-  g.moveTo(128, 0); g.lineTo(128, 256);
-  g.moveTo(0, 128); g.lineTo(256, 128);
-  g.stroke();
-  const t = new THREE.CanvasTexture(c);
-  t.wrapS = t.wrapT = THREE.RepeatWrapping;
-  t.repeat.set(1 / 10, 1 / 10);
-  t.anisotropy = 8;
-  t.colorSpace = THREE.SRGBColorSpace;
-  return t;
 }
 
 function paintedText(text: string): THREE.Mesh {
