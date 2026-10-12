@@ -396,13 +396,56 @@ function aeroGeo(t: TrainType): THREE.BufferGeometry {
   return b.build();
 }
 
+/** Freight wagon: an open BOXN for bulk, or a low well wagon for double-stack containers. */
+function wagonGeo(t: TrainType): THREE.BufferGeometry {
+  const b = new GeoBuilder();
+  const L = CAR.wagonLen;
+  b.block(PAL.dark, 0, 0.12, 0, W * 0.8, 0.08, L * 0.94);
+  bogie(b, L / 2 - 0.12, 1);
+  bogie(b, -L / 2 + 0.12, 1);
+  if (t.id === 'doublestack') {
+    b.block('#4a4f66', 0, 0.16, 0, W * 0.9, 0.06, L * 0.98);
+    for (const sz of [-1, 1]) b.block('#4a4f66', 0, 0.16, sz * (L / 2 - 0.03), W * 0.9, 0.16, 0.05);
+  } else {
+    const rust = '#8c5a3c';
+    const h = 0.36;
+    b.block(rust, 0, 0.16, 0, W * 0.92, 0.04, L * 0.96);
+    for (const sx of [-1, 1]) b.block(rust, sx * (W * 0.46 - 0.02), 0.2, 0, 0.04, h, L * 0.96);
+    for (const sz of [-1, 1]) b.block(rust, 0, 0.2, sz * (L * 0.48 - 0.02), W * 0.92, h, 0.04);
+    // side stanchions
+    for (const sx of [-1, 1]) for (const f of [-0.3, 0, 0.3]) b.block('#6e4630', sx * W * 0.47, 0.2, f * L, 0.03, h, 0.04);
+  }
+  return b.build();
+}
+
+/** What a loaded wagon shows: a heap of bulk, or two stacked containers (three colour schemes). */
+export function wagonLoadGeometry(t: TrainType, variant: number): THREE.BufferGeometry {
+  const key = `${t.id}|load|${variant % 3}`;
+  let g = carCache.get(key);
+  if (g) return g;
+  const b = new GeoBuilder();
+  const L = CAR.wagonLen;
+  if (t.id === 'doublestack') {
+    const schemes = [['#d0423f', '#3d63d6'], ['#2c3966', '#f2c12e'], ['#e7eaf2', '#2b8f6e']];
+    const [lo, hi] = schemes[variant % 3];
+    b.block(lo, 0, 0.22, 0, W * 0.86, 0.3, L * 0.92);
+    b.block(hi, 0, 0.53, 0, W * 0.86, 0.3, L * 0.92);
+  } else {
+    b.block('#2b2d38', 0, 0.2, 0, W * 0.84, 0.34, L * 0.88);
+    b.put(PRIM.pyramid, '#34374a', 0, 0.6, 0, W * 0.82, 0.14, L * 0.86);
+  }
+  g = b.build();
+  carCache.set(key, g);
+  return g;
+}
+
 const carCache = new Map<string, THREE.BufferGeometry>();
 
 export function carGeometry(t: TrainType, power: boolean): THREE.BufferGeometry {
   const key = `${t.id}|${power}`;
   let g = carCache.get(key);
   if (!g) {
-    g = power ? (t.nose === 'aero' ? aeroGeo(t) : locoGeo(t)) : coachGeo(t);
+    g = power ? (t.nose === 'aero' ? aeroGeo(t) : locoGeo(t)) : t.cargo ? wagonGeo(t) : coachGeo(t);
     carCache.set(key, g);
   }
   return g;

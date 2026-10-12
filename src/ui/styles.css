@@ -10,6 +10,7 @@
   --yellow: #f2c12e;
   --red: #d0423f;
   --green: #2f9e6a;
+  --freight: #e08a2c;
   --cut: 14px;
   font-family: 'Chakra Petch', system-ui, sans-serif;
   color: var(--ink);
@@ -371,3 +372,9 @@ body.panel-open .guide { display: none; }
 .rcard.running { border-left-color: var(--yellow); }
 .rcard.blocked { border-left-color: var(--line); }
 .rcard.blocked b { color: var(--ink-2); }
+
+/* ---------- freight ---------- */
+.types .group { font-size: 10px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-3); margin: 6px 0 0; }
+.types .group:first-child { margin-top: 0; }
+.legend i.frt { background: var(--freight); }
+.cash-pop.freight span { background: var(--freight); }

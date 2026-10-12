@@ -1,10 +1,11 @@
 import { city } from '../data/cities';
 import { KM_PER_UNIT } from '../data/geo';
-import { WORKS_SPEED } from '../data/research';
+import { DFC, WORKS_SPEED } from '../data/research';
+import { TrainType, isFreight } from '../data/trainTypes';
 
-/** Engineering works on a line: an upgrade to a faster class, or doubling. */
+/** Engineering works on a line: an upgrade to a faster class, doubling, or a freight corridor alongside. */
 export interface Works {
-  kind: 'upgrade' | 'double';
+  kind: 'upgrade' | 'double' | 'dfc';
   toKmh?: number; // upgrade target
   start: number; // game minutes
   end: number;
@@ -19,10 +20,18 @@ export interface TrackEdge {
   /** Line speed class (max km/h). */
   kmh: number;
   works: Works | null;
+  /** A dedicated freight corridor (double track) runs alongside. */
+  dfc: boolean;
   /** Number of signal blocks; crossing loops sit between them. */
   blocks: number;
   /** Runtime: trains whose head is on this edge: travel direction (+1 = a→b) and block. */
   occupants: Map<string, { dir: 1 | -1; block: number }>;
+  /** Runtime: the same for freight trains on the corridor. */
+  dfcOccupants: Map<string, { dir: 1 | -1; block: number }>;
+  /** Runtime: smoothed share of block capacity in use (0–1+), for the congestion view. */
+  util: number;
+  /** Runtime: smoothed train-minutes per hour spent held at signals waiting for this line. */
+  held: number;
   /** Runtime: event speed multiplier. */
   speedFactor: number;
 }
@@ -60,22 +69,43 @@ export function liveTracks(e: TrackEdge): 1 | 2 {
   return e.works?.kind === 'upgrade' ? 1 : e.tracks;
 }
 
+/** Works on the line itself slow it; a corridor is built alongside without disturbing traffic. */
+export function slowedByWorks(e: TrackEdge): boolean {
+  return e.works?.kind === 'upgrade' || e.works?.kind === 'double';
+}
+
 /** Line speed limit in km/h, allowing for works (events are applied separately). */
 export function lineKmh(e: TrackEdge): number {
-  return e.kmh * (e.works ? WORKS_SPEED : 1);
+  return e.kmh * (slowedByWorks(e) ? WORKS_SPEED : 1);
+}
+
+/** How a train type searches for routes. */
+export interface RouteMode {
+  minKmh?: number; // high-speed trains: only lines at least this fast
+  freight?: boolean; // freight uses corridors where there are any
+  needsDfc?: boolean; // only lines with a corridor
+}
+
+export function routeMode(t: TrainType): RouteMode {
+  return { minKmh: t.needsLineKmh, freight: isFreight(t), needsDfc: t.needsDfc };
+}
+
+/** Speed a train of this mode is planned at on a line, km/h. */
+export function routeKmh(e: TrackEdge, mode: RouteMode): number {
+  return mode.freight && e.dfc ? DFC.kmh : lineKmh(e);
 }
 
 export class Network {
   edges = new Map<string, TrackEdge>();
   adj = new Map<string, { edge: TrackEdge; to: string }[]>();
 
-  addEdge(a: string, b: string, tracks: 1 | 2 = 1, kmh = 110): TrackEdge {
+  addEdge(a: string, b: string, tracks: 1 | 2 = 1, kmh = 110, dfc = false): TrackEdge {
     const id = edgeId(a, b);
     const existing = this.edges.get(id);
     if (existing) return existing;
     const length = distance(a, b);
     const e: TrackEdge = {
-      id, a, b, length, tracks, kmh, works: null, occupants: new Map(), speedFactor: 1,
+      id, a, b, length, tracks, kmh, works: null, dfc, occupants: new Map(), dfcOccupants: new Map(), util: 0, held: 0, speedFactor: 1,
       blocks: Math.max(1, Math.round(length / BLOCK_UNITS)),
     };
     this.edges.set(id, e);
@@ -114,7 +144,7 @@ export class Network {
    * around works when there is a quicker way. `minKmh` restricts the search to lines at
    * least that fast (high-speed trains).
    */
-  shortestPath(a: string, b: string, minKmh = 0): string[] | null {
+  shortestPath(a: string, b: string, mode: RouteMode = {}): string[] | null {
     if (a === b) return [a];
     if (!this.adj.has(a) || !this.adj.has(b)) return null;
     const dist = new Map<string, number>([[a, 0]]);
@@ -132,9 +162,9 @@ export class Network {
       if (cur === b) break;
       done.add(cur);
       for (const { edge, to } of this.adj.get(cur) ?? []) {
-        if (done.has(to) || edge.kmh < minKmh) continue;
+        if (done.has(to) || edge.kmh < (mode.minKmh ?? 0) || (mode.needsDfc && !edge.dfc)) continue;
         // a little per-section overhead keeps routes from zig-zagging through every junction
-        const nd = best + edge.length / lineKmh(edge) + 0.02;
+        const nd = best + edge.length / routeKmh(edge, mode) + 0.02;
         if (nd < (dist.get(to) ?? Infinity)) {
           dist.set(to, nd);
           prev.set(to, cur);
@@ -149,11 +179,11 @@ export class Network {
   }
 
   /** Full node path through a list of stops, or null if any leg is unreachable. */
-  routePath(stops: string[], minKmh = 0): string[] | null {
+  routePath(stops: string[], mode: RouteMode = {}): string[] | null {
     if (stops.length < 2) return null;
     const out: string[] = [stops[0]];
     for (let i = 1; i < stops.length; i++) {
-      const leg = this.shortestPath(stops[i - 1], stops[i], minKmh);
+      const leg = this.shortestPath(stops[i - 1], stops[i], mode);
       if (!leg) return null;
       out.push(...leg.slice(1));
     }

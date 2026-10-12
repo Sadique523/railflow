@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { CAR } from '../data/trainTypes';
 import { COLORS } from './palette';
 import { VCOL } from './batch';
-import { carGeometry } from './models';
+import { carGeometry, wagonLoadGeometry } from './models';
 import type { Game } from '../sim/game';
 import type { Train } from '../sim/train';
 
@@ -10,6 +10,8 @@ interface CarView {
   obj: THREE.Group;
   center: number;
   len: number;
+  /** Freight wagons: the visible load, shown when the wagon is full. */
+  load?: THREE.Mesh;
 }
 
 interface TrainViewEntry {
@@ -55,7 +57,15 @@ export class TrainView {
         if (c.power && i === all.length - 1) mesh.rotation.y = Math.PI;
         obj.add(mesh);
         root.add(obj);
-        return { obj, center: c.center, len: c.len };
+        let load: THREE.Mesh | undefined;
+        if (t.freight && !c.power) {
+          load = new THREE.Mesh(wagonLoadGeometry(t.type, i), VCOL);
+          load.position.y = CAR.railTop;
+          load.castShadow = true;
+          load.visible = false;
+          obj.add(load);
+        }
+        return { obj, center: c.center, len: c.len, load };
       });
       this.group.add(root);
       this.views.set(t.cfg.id, { train: t, root, cars });
@@ -65,7 +75,10 @@ export class TrainView {
   update(game: Game, selected: string | null, time: number) {
     for (const v of this.views.values()) {
       const t = v.train;
+      // fill wagons from the front in proportion to the tonnage aboard
+      let full = t.freight ? Math.round((t.load / t.capacity) * t.cfg.coaches) : 0;
       for (const c of v.cars) {
+        if (c.load) c.load.visible = full-- > 0;
         t.sample(t.pos - c.center + c.len / 2, game.net, this.p);
         t.sample(t.pos - c.center - c.len / 2, game.net, this.q);
         c.obj.position.set((this.p.x + this.q.x) / 2, 0, (this.p.z + this.q.z) / 2);

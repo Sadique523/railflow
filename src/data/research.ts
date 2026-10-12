@@ -43,7 +43,30 @@ export const RESEARCH: ResearchProject[] = [
     blurb: 'Dedicated standard-gauge high-speed lines on viaducts. Hugely expensive and slow to build.',
     unlocks: 'High-speed lines (300 km/h) and the bullet train',
   },
+  {
+    id: 'wag12', name: 'WAG-12 locomotives', cost: 80, hours: 24, requires: [],
+    blurb: '12,000 hp twin-section electric locomotives for heavier, faster bulk trains.',
+    unlocks: 'Heavy haul freight trains',
+  },
+  {
+    id: 'dfc', name: 'Dedicated freight corridors', cost: 140, hours: 48, requires: [],
+    blurb: 'A separate double-track freight railway built alongside an existing line. Freight stops blocking passenger trains.',
+    unlocks: 'Building freight corridors along your lines',
+  },
+  {
+    id: 'doublestack', name: 'Double-stack containers', cost: 90, hours: 30, requires: ['dfc'],
+    blurb: 'High-rise overhead wires on the corridors let wagons carry two containers stacked.',
+    unlocks: 'Double-stack container trains',
+  },
 ];
+
+/** Freight corridor alongside a line: ₹ Cr per km, km built per day, upkeep per km per day. */
+export const DFC = { costPerKm: 0.3, kmPerDay: 120, upkeepPerKmDay: 0.004, kmh: 100, color: '#c77a2e' };
+
+/** Sideways distance from a line's centre to its freight corridor's centre (world units). */
+export function dfcOffset(tracks: 1 | 2): number {
+  return (tracks === 2 ? 3.4 : 2.3) / 2 + 1.9;
+}
 
 export const RESEARCH_BY_ID = new Map(RESEARCH.map((r) => [r.id, r]));
 

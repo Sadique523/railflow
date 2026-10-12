@@ -21,6 +21,7 @@ const ICONS = {
   select: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 3l14 8-6 2-2 6z"/></svg>',
   track: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2L5 22M16 2l3 20M6.5 7h11M6 12h12M5.3 17h13.4"/></svg>',
   train: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="3" width="14" height="14" rx="1"/><path d="M5 11h14M8 21l2-4M16 21l-2-4"/></svg>',
+  traffic: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20L10 4M14 4l6 16M12 6v2M12 11v2M12 16v2"/></svg>',
   research: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3h6M10 3v6l-5 9a2 2 0 0 0 2 3h10a2 2 0 0 0 2-3l-5-9V3M7.5 15h9"/></svg>',
   money: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 4h11M7 9h11M7 4c6 0 6 9 0 9h-1l9 8"/></svg>',
 };
@@ -51,6 +52,8 @@ export class App {
   private lastUi = 0;
   private clock = 0;
   private guideDismissed = false;
+  private congestionOn = false;
+  private lastCongestion = 0;
 
   constructor(private root: HTMLElement) {
     this.game = Game.load() ?? new Game();
@@ -134,7 +137,9 @@ export class App {
       (this.ui.researchBtn = h('button', { class: 'tool', title: 'Research (R)', onclick: () => this.togglePanel('research') },
         svg(ICONS.research), h('span', { class: 't' }, 'Research'), h('span', { class: 'key' }, 'R'))),
       (this.ui.moneyBtn = h('button', { class: 'tool', title: 'Money (M)', onclick: () => this.toggleMoney() },
-        svg(ICONS.money), h('span', { class: 't' }, 'Money'), h('span', { class: 'key' }, 'M'))))));
+        svg(ICONS.money), h('span', { class: 't' }, 'Money'), h('span', { class: 'key' }, 'M'))),
+      (this.ui.trafficBtn = h('button', { class: 'tool', title: 'Traffic view: how busy each line is (C)', onclick: () => this.toggleCongestion() },
+        svg(ICONS.traffic), h('span', { class: 't' }, 'Traffic'), h('span', { class: 'key' }, 'C'))))));
 
     // bottom stats
     const segs = (cls: string, key: string) => (this.ui[key] = h('div', { class: `bar ${cls}` }, Array.from({ length: 10 }, () => h('i'))));
@@ -175,6 +180,7 @@ export class App {
           h('li', null, h('kbd', null, 'T'), ' Track tool: click a city, then another to lay line. Keep clicking to chain.'),
           h('li', null, h('kbd', null, 'N'), ' New train: choose a preset, coaches and stops. It shuttles end to end.'),
           h('li', null, 'Click a line to ', h('b', null, 'double'), ' or ', h('b', null, 'speed it up'), '. Works slow the line for days, so plan a way round first.'),
+          h('li', null, 'Run ', h('b', null, 'goods trains'), ' from coal fields, steel plants, grain belts and ports. Freight pays the bills but clogs shared lines; ', h('kbd', null, 'C'), ' shows traffic.'),
           h('li', null, h('kbd', null, 'R'), ' Research: you start with MEMU and Express. LHB coaches, faster track, Kavach, Vande Bharat and bullet trains come later.')),
         h('h3', null, 'Score'),
         h('ul', null,
@@ -268,6 +274,13 @@ export class App {
     this.togglePanel('finance');
   }
 
+  toggleCongestion() {
+    this.congestionOn = !this.congestionOn;
+    this.ui.trafficBtn.classList.toggle('on', this.congestionOn);
+    this.lastCongestion = -1;
+    if (!this.congestionOn) this.tracks.showCongestion(null);
+  }
+
   /** Open or close one of the full-height panels (money, research). */
   togglePanel(kind: 'finance' | 'research') {
     if (this.selection?.kind === kind) return this.select(null);
@@ -325,6 +338,7 @@ export class App {
       else if (k === 'v') this.setTool('select');
       else if (k === 'm') this.toggleMoney();
       else if (k === 'r') this.togglePanel('research');
+      else if (k === 'c') this.toggleCongestion();
       else if (k === 'escape') {
         if (this.tool === 'track' && this.trackFrom) { this.trackFrom = null; this.tracks.showGhost(null, null, true); }
         else if (this.tool !== 'select') this.setTool('select');
@@ -374,7 +388,11 @@ export class App {
     const g = this.game;
     const speed = SPEEDS[this.speedIdx];
     if (speed) g.update(dt * speed * GAME_MIN_PER_SEC);
-    for (const p of g.payouts.splice(0)) this.cashPop(p.cityId, p.amount);
+    for (const p of g.payouts.splice(0)) this.cashPop(p.cityId, p.amount, p.freight);
+    if (this.congestionOn && this.clock - this.lastCongestion > 0.25) {
+      this.lastCongestion = this.clock;
+      this.tracks.showCongestion(g, THREE.MathUtils.clamp(this.stage.distance / 90, 1.2, 9));
+    }
 
     if (g.version !== this.seenVersion) {
       this.seenVersion = g.version;
@@ -415,10 +433,10 @@ export class App {
   }
 
   /** Floating "+₹" over a station where a train just collected fares. */
-  private cashPop(cityId: string, amount: number) {
+  private cashPop(cityId: string, amount: number, freight = false) {
     if (amount < 0.005) return;
     const c = city(cityId);
-    const el = h('div', { class: 'cash-pop' }, h('span', null, fmt.money(amount, true)));
+    const el = h('div', { class: `cash-pop${freight ? ' freight' : ''}` }, h('span', null, fmt.money(amount, true)));
     const obj = new CSS2DObject(el);
     obj.position.set(c.x, 4, c.z);
     obj.center.set(0.5, 1);

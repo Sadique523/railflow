@@ -1,5 +1,6 @@
 import { CITIES, city } from '../data/cities';
-import { PAX_CLASSES, PAX_CLASS_INFO, TRAIN_TYPES, TRAIN_TYPE_BY_ID, TrainType, trainCapacity, trainCost, trainSeats } from '../data/trainTypes';
+import { PAX_CLASSES, PAX_CLASS_INFO, TRAIN_TYPES, TRAIN_TYPE_BY_ID, TrainType, isFreight, trainCapacity, trainCost, trainSeats } from '../data/trainTypes';
+import { COMMODITY_INFO } from '../data/freight';
 import { RESEARCH_BY_ID } from '../data/research';
 import { km } from '../sim/network';
 import { Train } from '../sim/train';
@@ -80,7 +81,9 @@ export class TrainBuilder {
       h('div', { class: 'section' },
         h('div', { class: 'lbl' }, h('span', { class: 'n' }, '02'), 'Formation'),
         this.formation(),
-        h('p', { class: 'blurb' }, `${t.minCoaches}–${t.maxCoaches} coaches · ${t.seatsPerCoach} seats each${t.standingFactor > 1 ? ` · standing up to ${Math.round(t.standingFactor * 100)}%` : ''}`),
+        h('p', { class: 'blurb' }, isFreight(t)
+          ? `${t.minCoaches}–${t.maxCoaches} wagons · ${t.seatsPerCoach} t each`
+          : `${t.minCoaches}–${t.maxCoaches} coaches · ${t.seatsPerCoach} seats each${t.standingFactor > 1 ? ` · standing up to ${Math.round(t.standingFactor * 100)}%` : ''}`),
       ),
       h('div', { class: 'section' },
         h('div', { class: 'lbl' }, h('span', { class: 'n' }, '03'), 'Route'),
@@ -95,25 +98,27 @@ export class TrainBuilder {
 
   private typeSection() {
     const g = this.host.game;
-    const list = h('div', { class: 'types' },
-      TRAIN_TYPES.map((t) => {
-        const locked = !g.isResearched(t.research);
-        return h('button', {
-          class: `type${t.id === this.typeId ? ' on' : ''}${locked ? ' locked' : ''}`,
-          disabled: locked,
-          title: locked ? `Unlocked by research: ${RESEARCH_BY_ID.get(t.research!)!.name}` : '',
-          onclick: () => {
-            this.typeId = t.id;
-            this.coaches = t.defaultCoaches;
-            this.render();
-          },
+    const card = (t: TrainType) => {
+      const locked = !g.isResearched(t.research);
+      return h('button', {
+        class: `type${t.id === this.typeId ? ' on' : ''}${locked ? ' locked' : ''}`,
+        disabled: locked,
+        title: locked ? `Unlocked by research: ${RESEARCH_BY_ID.get(t.research!)!.name}` : '',
+        onclick: () => {
+          this.typeId = t.id;
+          this.coaches = t.defaultCoaches;
+          this.render();
         },
-        h('span', { class: 'stripe', style: `background:${t.accent}` }),
-        h('span', { class: 'nm' }, t.name),
-        h('span', { class: 'price' }, locked ? `🔒 ${RESEARCH_BY_ID.get(t.research!)!.name}` : fmt.cr(trainCost(t, t.defaultCoaches))),
-        h('span', { class: 'meta' }, `${t.cruiseKmh} km/h · `, classTags(t)),
-        );
-      }),
+      },
+      h('span', { class: 'stripe', style: `background:${t.accent}` }),
+      h('span', { class: 'nm' }, t.name),
+      h('span', { class: 'price' }, locked ? `🔒 ${RESEARCH_BY_ID.get(t.research!)!.name}` : fmt.cr(trainCost(t, t.defaultCoaches))),
+      h('span', { class: 'meta' }, `${t.cruiseKmh} km/h · `, classTags(t)),
+      );
+    };
+    const list = h('div', { class: 'types' },
+      h('div', { class: 'group' }, 'Passenger'), TRAIN_TYPES.filter((t) => !isFreight(t)).map(card),
+      h('div', { class: 'group' }, 'Freight'), TRAIN_TYPES.filter(isFreight).map(card),
     );
     return h('div', { class: 'section' },
       h('div', { class: 'lbl' }, h('span', { class: 'n' }, '01'), 'Train type'),
@@ -209,7 +214,9 @@ export class TrainBuilder {
     }
     const opDay = (t.opCostPerHour + t.opCostPerCoachHour * this.coaches) * 24;
     rows.push(
-      h('span', null, 'Seats / max load'), h('span', null, `${fmt.int(trainSeats(t, this.coaches))} / ${fmt.int(trainCapacity(t, this.coaches))}`),
+      ...(isFreight(t)
+        ? [h('span', null, 'Capacity'), h('span', null, `${fmt.int(trainCapacity(t, this.coaches))} t`)]
+        : [h('span', null, 'Seats / max load'), h('span', null, `${fmt.int(trainSeats(t, this.coaches))} / ${fmt.int(trainCapacity(t, this.coaches))}`)]),
       h('span', null, 'Running cost'), h('span', null, `${fmt.cr(opDay)} / day`),
       h('span', null, 'Purchase'), h('span', { class: cost > g.funds ? 'neg' : '' }, fmt.cr(cost)),
     );
@@ -235,8 +242,12 @@ export class TrainBuilder {
   }
 }
 
-/** Small coloured tags for the passenger classes a train type carries. */
+/** Small coloured tags for the passenger classes or commodities a train type carries. */
 function classTags(t: TrainType): HTMLElement {
+  if (t.cargo) {
+    return h('span', { class: 'cls-tags' }, t.cargo.map((c) =>
+      h('span', { class: 'cls', style: `--c:${COMMODITY_INFO[c].color}` }, COMMODITY_INFO[c].name)));
+  }
   return h('span', { class: 'cls-tags' }, PAX_CLASSES.filter((c) => t.fares[c] !== undefined).map((c) =>
     h('span', { class: 'cls', style: `--c:${PAX_CLASS_INFO[c].color}` }, PAX_CLASS_INFO[c].name)));
 }

@@ -1,7 +1,7 @@
 // Money book-keeping: every change to funds is booked under a flow, per game hour.
 
-export type Flow = 'fares' | 'running' | 'upkeep' | 'track' | 'trains' | 'research' | 'sales';
-export const FLOWS: Flow[] = ['fares', 'running', 'upkeep', 'track', 'trains', 'research', 'sales'];
+export type Flow = 'fares' | 'freight' | 'running' | 'upkeep' | 'track' | 'trains' | 'research' | 'sales';
+export const FLOWS: Flow[] = ['fares', 'freight', 'running', 'upkeep', 'track', 'trains', 'research', 'sales'];
 
 export type Sums = Record<Flow, number>;
 
@@ -11,7 +11,7 @@ export interface Bucket extends Sums {
 
 const KEEP_HOURS = 48;
 
-export const zero = (): Sums => ({ fares: 0, running: 0, upkeep: 0, track: 0, trains: 0, research: 0, sales: 0 });
+export const zero = (): Sums => ({ fares: 0, freight: 0, running: 0, upkeep: 0, track: 0, trains: 0, research: 0, sales: 0 });
 
 export class Ledger {
   /** Oldest first; hours with no money movement are left out. */
@@ -58,7 +58,7 @@ export class Ledger {
     const span = Math.min(hours - 1 + ((now / 60) % 1), (now - this.since) / 60);
     if (span < 0.25) return 0;
     const s = this.window(now, hours);
-    return (s.fares + s.running + s.upkeep) / span;
+    return (s.fares + s.freight + s.running + s.upkeep) / span;
   }
 
   toJSON() {

@@ -18,11 +18,14 @@ npm run build    # production build in dist/
 | `N` | New train: pick a preset, number of coaches and stops (click cities on the map or use the list). |
 | `V` / `Esc` | Select: click a station, train or line to inspect it. |
 | `R` | Research: unlock train types, faster track and Kavach, one project at a time. |
+| `C` | Traffic view: every line coloured from green (quiet) to red (trains queueing). |
 | `M` | Money: profit per hour, a 24 h chart of fares vs running costs, and profit by train. Also opens from the Funds panel. |
 | Drag / right-drag / wheel | Pan / rotate / zoom (also `WASD`, `Q`/`E`). |
 | `Space`, `1`–`4` | Pause, game speed. |
 
 You start with MEMU and Express trains on 110 km/h track. Research unlocks LHB coaches (Shatabdi, Rajdhani), 130 km/h track, Kavach train protection, Vande Bharat, 160 km/h track and finally high-speed lines with the bullet train. A train only runs as fast as the line allows, so new trains need upgraded lines. Upgrading or doubling a line means days of works: the line drops to a quarter of its speed (and to one track if it was double), and trains divert by the fastest way round if you have built one. Lines above 110 km/h without Kavach see signal incidents.
+
+Freight pays the bills, as on the real Indian Railways. Goods trains load coal at Dhanbad, Ranchi, Raipur and Nagpur; steel and ore at Ranchi, Raipur, Bhubaneswar and Visakhapatnam; grain in Punjab and Madhya Pradesh; and containers at the ports and inland depots. They earn by tonne and distance when they unload (coal trains usually come back empty; containers fill both ways), but they are slow and hold up passenger trains on shared lines. Research unlocks WAG-12 heavy haul, dedicated freight corridors (a separate double-track freight line built alongside an existing one, without disrupting it) and double-stack container trains that only run on corridors.
 
 Passengers come in three classes. Most travel general class and only board cheap trains (MEMU, Express); a smaller AC crowd and a thin premium crowd pay more, ride the premium trains and care most about speed. Faster and more frequent service between two stations brings more passengers.
 
@@ -41,7 +44,7 @@ Single lines are split into ~50 km signal blocks with crossing loops between the
 
 ## Code map
 
-- `src/data`: cities (lat/lon/population), projection, world and play-area extents (`geo.ts`), country borders and rivers (`mapdata.json`), train presets (`trainTypes.ts`; add new types here for custom trains later)
+- `src/data`: cities (lat/lon/population), freight flows (`freight.ts`), projection, world and play-area extents (`geo.ts`), country borders and rivers (`mapdata.json`), train presets (`trainTypes.ts`; add new types here for custom trains later)
 - `src/sim`: pure simulation: `network.ts` (track graph, Dijkstra), `train.ts` (path, blocks, timetable), `game.ts` (signalling, passengers, economy, events, save/load), `ledger.ts` (money booked by flow and hour); `src/data/research.ts` holds the research tree and line speed classes
 - `src/render`: Three.js scene: `stage.ts` (camera, lights, AO), `terrain.ts` (endless sea, land plates, painted map, haze), `world.ts` (stations, buildings), `tracks.ts`, `trains.ts`
 - `src/ui`: HUD and panels (`app.ts` controller, `builder.ts` train builder, `inspector.ts`)

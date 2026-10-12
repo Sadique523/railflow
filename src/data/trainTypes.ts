@@ -1,3 +1,5 @@
+import type { Commodity } from './freight';
+
 // Train presets. Everything a train does is driven by these numbers, so a
 // future custom-train editor only needs to produce another TrainType.
 
@@ -42,14 +44,23 @@ export interface TrainType {
   research?: string;
   /** Only runs where every section of its route is at least this fast. */
   needsLineKmh?: number;
+  /**
+   * Freight trains carry these commodities instead of passengers; `seatsPerCoach` is then
+   * tonnes per wagon and `coaches` counts wagons.
+   */
+  cargo?: Commodity[];
+  /** Only runs where every section of its route has a dedicated freight corridor. */
+  needsDfc?: boolean;
 }
+
+export const isFreight = (t: TrainType) => !!t.cargo;
 
 export const TRAIN_TYPES: TrainType[] = [
   {
     id: 'memu', name: 'MEMU Passenger', short: 'MEMU',
     blurb: 'Slow commuter EMU for short hops. Huge standing capacity, quick off the mark, very cheap to run. General class only.',
     cruiseKmh: 80, accelKmhPerMin: 25, minCoaches: 8, maxCoaches: 16, defaultCoaches: 12,
-    seatsPerCoach: 90, standingFactor: 2, comfort: -10, fares: { general: 0.6 },
+    seatsPerCoach: 90, standingFactor: 2, comfort: -10, fares: { general: 0.4 },
     baseCost: 8, coachCost: 0.8, opCostPerHour: 0.08, opCostPerCoachHour: 0.005,
     accent: '#f2c12e', nose: 'aero', numberPrefix: '6',
   },
@@ -57,7 +68,7 @@ export const TRAIN_TYPES: TrainType[] = [
     id: 'mail', name: 'Mail / Express', short: 'Express',
     blurb: 'The workhorse. Long rakes of general and sleeper coaches with a few AC coaches. Carries the masses cheaply.',
     cruiseKmh: 110, accelKmhPerMin: 10, minCoaches: 12, maxCoaches: 24, defaultCoaches: 18,
-    seatsPerCoach: 72, standingFactor: 1.4, comfort: 0, fares: { general: 1.0, ac: 1.6 },
+    seatsPerCoach: 72, standingFactor: 1.4, comfort: 0, fares: { general: 0.7, ac: 1.6 },
     baseCost: 15, coachCost: 1.2, opCostPerHour: 0.12, opCostPerCoachHour: 0.01,
     accent: '#24315e', nose: 'flat', numberPrefix: '1',
   },
@@ -93,6 +104,30 @@ export const TRAIN_TYPES: TrainType[] = [
     baseCost: 120, coachCost: 8, opCostPerHour: 0.5, opCostPerCoachHour: 0.04,
     accent: '#1e9e7a', nose: 'aero', numberPrefix: '0', research: 'hsr', needsLineKmh: 300,
   },
+  {
+    id: 'goods', name: 'Goods train', short: 'Goods',
+    blurb: 'A WAG-9 hauling a long rake of wagons. Slow, carries anything, and pays far better than passengers. It will hold up faster trains on a shared line.',
+    cruiseKmh: 75, accelKmhPerMin: 6, minCoaches: 30, maxCoaches: 58, defaultCoaches: 45,
+    seatsPerCoach: 60, standingFactor: 1, comfort: 0, fares: {},
+    baseCost: 18, coachCost: 0.25, opCostPerHour: 0.1, opCostPerCoachHour: 0.002,
+    accent: '#b3462f', nose: 'flat', numberPrefix: '9', cargo: ['coal', 'steel', 'grain', 'containers'],
+  },
+  {
+    id: 'heavyhaul', name: 'Heavy haul (WAG-12)', short: 'Heavy haul',
+    blurb: '12,000 hp electric locomotives built at Madhepura. Longer, faster bulk trains of coal, ore and grain.',
+    cruiseKmh: 100, accelKmhPerMin: 9, minCoaches: 40, maxCoaches: 90, defaultCoaches: 60,
+    seatsPerCoach: 65, standingFactor: 1, comfort: 0, fares: {},
+    baseCost: 40, coachCost: 0.3, opCostPerHour: 0.16, opCostPerCoachHour: 0.002,
+    accent: '#6b4fa0', nose: 'flat', numberPrefix: '9', cargo: ['coal', 'steel', 'grain'], research: 'wag12',
+  },
+  {
+    id: 'doublestack', name: 'Double-stack containers', short: 'Double-stack',
+    blurb: 'Two containers per wagon, only possible under the high wires of a dedicated freight corridor. Needs DFC on every section.',
+    cruiseKmh: 100, accelKmhPerMin: 8, minCoaches: 40, maxCoaches: 90, defaultCoaches: 60,
+    seatsPerCoach: 80, standingFactor: 1, comfort: 0, fares: {},
+    baseCost: 35, coachCost: 0.4, opCostPerHour: 0.14, opCostPerCoachHour: 0.002,
+    accent: '#1f7a8c', nose: 'flat', numberPrefix: '9', cargo: ['containers'], research: 'doublestack', needsDfc: true,
+  },
 ];
 
 export const TRAIN_TYPE_BY_ID = new Map(TRAIN_TYPES.map((t) => [t.id, t]));
@@ -110,9 +145,15 @@ export function trainSeats(t: TrainType, coaches: number): number {
 }
 
 // Visual dimensions (world units)
-export const CAR = { powerLen: 1.6, coachLen: 1.1, gap: 0.1, width: 0.66, height: 0.62, lane: 0.62, railTop: 0.345 };
+export const CAR = { powerLen: 1.6, coachLen: 1.1, wagonLen: 0.5, gap: 0.1, wagonGap: 0.05, width: 0.66, height: 0.62, lane: 0.62, railTop: 0.345 };
 
-export function trainLength(coaches: number): number {
-  // power car at each end + coaches
-  return 2 * CAR.powerLen + coaches * CAR.coachLen + (coaches + 1) * CAR.gap;
+/** Length and gap of one coach or wagon of this type. */
+export function vehicleLen(t: TrainType): { len: number; gap: number } {
+  return isFreight(t) ? { len: CAR.wagonLen, gap: CAR.wagonGap } : { len: CAR.coachLen, gap: CAR.gap };
+}
+
+export function trainLength(t: TrainType, coaches: number): number {
+  // power car at each end + coaches or wagons
+  const v = vehicleLen(t);
+  return 2 * CAR.powerLen + coaches * v.len + (coaches + 1) * v.gap;
 }

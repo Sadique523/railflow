@@ -1,12 +1,13 @@
 import { CITIES, city } from '../data/cities';
 import { PAX_CLASSES, PAX_CLASS_INFO, PaxClass, TRAIN_TYPE_BY_ID, trainCost } from '../data/trainTypes';
 import {
-  DOUBLING_KM_PER_DAY, RESEARCH_BY_ID, lineClass, nextLineClass,
+  DFC, DOUBLING_KM_PER_DAY, RESEARCH_BY_ID, lineClass, nextLineClass,
 } from '../data/research';
+import { COMMODITIES, COMMODITY_INFO, Commodity, flowWeight } from '../data/freight';
 import {
-  MAX_TRACK_KM, Network, TrackEdge, distance, doubleCost, edgeId, km, liveTracks, trackCost,
+  MAX_TRACK_KM, Network, TrackEdge, distance, doubleCost, edgeId, km, liveTracks, routeMode, trackCost,
 } from './network';
-import { ON_TIME_MIN, PaxGroup, Segment, Train, TrainConfig } from './train';
+import { CargoGroup, ON_TIME_MIN, PaxGroup, Segment, Train, TrainConfig } from './train';
 import { Flow, Ledger } from './ledger';
 
 export const START_FUNDS = 600;
@@ -20,7 +21,15 @@ const CROWD_TOLERANCE: Record<PaxClass, number> = { general: 0.4, ac: 1, premium
 const GIVE_UP_MIN = 6 * 60;
 const MAX_WAITING_PER_DEST = 1500;
 const HEADWAY = 2.5;
+/** Tonnes per hour of freight offered per unit of flow weight. */
+const FREIGHT_PER_HOUR = 55;
+const MAX_CARGO_WAITING = 8000; // tonnes per flow; beyond this shippers use the road
 const SAVE_KEY = 'railflow-save-v1';
+
+/** The block reservations a segment uses: the main line, or the freight corridor alongside. */
+function occupancy(s: Segment) {
+  return s.dfc ? s.edge.dfcOccupants : s.edge.occupants;
+}
 
 /** 0, ½, ¼, ¾, ⅛ … (van der Corput): evenly fills a cycle however many trains join it. */
 function spread(k: number): number {
@@ -42,6 +51,7 @@ function fmtClock(min: number): string {
 export interface Station {
   id: string;
   waiting: PaxGroup[];
+  cargo: CargoGroup[];
   acc: Map<string, number>;
   demandMult: number;
 }
@@ -69,6 +79,7 @@ export interface Payout {
   trainId: string;
   cityId: string;
   amount: number;
+  freight: boolean;
 }
 
 /** One class of passengers between two stations, and the service they get. */
@@ -92,6 +103,7 @@ export interface Stats {
   onTimeArrivals: number;
   revenue: number;
   costs: number;
+  freightTons: number;
 }
 
 export class Game {
@@ -101,7 +113,7 @@ export class Game {
   time = 6 * 60; // game minutes since Day 1 00:00
   funds = START_FUNDS;
   score = 0;
-  stats: Stats = { delivered: 0, gaveUp: 0, arrivals: 0, onTimeArrivals: 0, revenue: 0, costs: 0 };
+  stats: Stats = { delivered: 0, gaveUp: 0, arrivals: 0, onTimeArrivals: 0, revenue: 0, costs: 0, freightTons: 0 };
   events: GameEvent[] = [];
   log: LogEntry[] = [];
   ledger = new Ledger(this.time);
@@ -113,6 +125,10 @@ export class Game {
   private recentArrivals: boolean[] = [];
   private servedPairs: ServedPair[] = [];
   research: ResearchState = { done: new Set(), active: null };
+  /** Freight flows some train can carry: commodity from o to d, and how many trains offer it. */
+  private freightFlows: { o: string; d: string; c: Commodity; trains: number }[] = [];
+  /** Train-minutes spent held at signals this step, by line, for the congestion view. */
+  private heldThisStep = new Map<TrackEdge, number>();
   private nextTrainNum = 1;
   private nextEventAt = this.time + 20 * 60;
   private logId = 0;
@@ -123,7 +139,7 @@ export class Game {
 
   constructor() {
     for (const c of CITIES) {
-      this.stations.set(c.id, { id: c.id, waiting: [], acc: new Map(), demandMult: 1 });
+      this.stations.set(c.id, { id: c.id, waiting: [], cargo: [], acc: new Map(), demandMult: 1 });
     }
   }
 
@@ -162,7 +178,7 @@ export class Game {
   /** The only place funds change. Income is positive, spending negative. */
   private book(flow: Flow, amount: number, train?: Train) {
     this.funds += amount;
-    if (flow === 'fares') this.stats.revenue += amount;
+    if (flow === 'fares' || flow === 'freight') this.stats.revenue += amount;
     else if (amount < 0) this.stats.costs -= amount;
     this.ledger.add(flow, amount, this.time);
     train?.money.add(flow, amount, this.time);
@@ -208,7 +224,7 @@ export class Game {
   trainsUsingEdge(id: string): Train[] {
     const out: Train[] = [];
     for (const t of this.trains.values()) {
-      const route = this.net.routePath(t.cfg.stops, t.type.needsLineKmh ?? 0) ?? [];
+      const route = this.net.routePath(t.cfg.stops, routeMode(t.type)) ?? [];
       const uses = (p: string[]) => p.some((n, i) => i > 0 && edgeId(p[i - 1], n) === id);
       if (uses(t.path) || uses(route)) out.push(t);
     }
@@ -300,6 +316,30 @@ export class Game {
     return { ok: true, cost, hours };
   }
 
+  /** Building a freight corridor alongside a line: cost, time, and why not. */
+  dfcInfo(id: string): { ok: boolean; cost?: number; hours?: number; reason?: string } {
+    const e = this.net.edges.get(id);
+    if (!e) return { ok: false, reason: 'No such line' };
+    if (e.dfc) return { ok: false, reason: 'Corridor built' };
+    const cost = km(e.length) * DFC.costPerKm;
+    const hours = Math.max(8, (km(e.length) / DFC.kmPerDay) * 24);
+    if (!this.research.done.has('dfc')) return { ok: false, cost, hours, reason: 'Research Dedicated freight corridors' };
+    if (e.works) return { ok: false, cost, hours, reason: 'Works already under way' };
+    if (cost > this.funds) return { ok: false, cost, hours, reason: 'Not enough funds' };
+    return { ok: true, cost, hours };
+  }
+
+  buildDfc(id: string): boolean {
+    const info = this.dfcInfo(id);
+    if (!info.ok) return false;
+    const e = this.net.edges.get(id)!;
+    this.book('track', -info.cost!);
+    e.works = { kind: 'dfc', start: this.time, end: this.time + info.hours! * 60 };
+    this.version++;
+    this.notify(`Freight corridor under construction: ${city(e.a).name} – ${city(e.b).name}. Built alongside, so traffic keeps moving.`);
+    return true;
+  }
+
   /** Trains on a line that could take another way round, for planning works. */
   diversions(id: string): { users: Train[]; stuck: Train[] } {
     const e = this.net.edges.get(id);
@@ -308,7 +348,7 @@ export class Game {
     const saved = e.kmh;
     e.kmh = 0.001; // price the line out of the route search
     const stuck = users.filter((t) => {
-      const p = this.net.routePath(t.cfg.stops, t.type.needsLineKmh ?? 0);
+      const p = this.net.routePath(t.cfg.stops, routeMode(t.type));
       return !p || p.some((n, i) => i > 0 && edgeId(p[i - 1], n) === id);
     });
     e.kmh = saved;
@@ -329,10 +369,12 @@ export class Game {
       const w = e.works;
       if (!w || this.time < w.end) continue;
       if (w.kind === 'upgrade') e.kmh = w.toKmh!;
+      else if (w.kind === 'dfc') e.dfc = true;
       else e.tracks = 2;
       e.works = null;
       this.version++;
-      this.notify(`Works complete: ${city(e.a).name} – ${city(e.b).name} ${w.kind === 'upgrade' ? `now ${e.kmh} km/h` : 'now double track'}`, 'good');
+      const what = w.kind === 'upgrade' ? `now ${e.kmh} km/h` : w.kind === 'dfc' ? 'freight corridor open' : 'now double track';
+      this.notify(`Works complete: ${city(e.a).name} – ${city(e.b).name} ${what}`, 'good');
     }
   }
 
@@ -341,9 +383,13 @@ export class Game {
     for (let i = 1; i < stops.length; i++) {
       if (stops[i] === stops[i - 1]) return { ok: false, reason: 'Consecutive stops must differ' };
     }
-    const minKmh = (typeId && TRAIN_TYPE_BY_ID.get(typeId)?.needsLineKmh) || 0;
-    const path = this.net.routePath(stops, minKmh);
-    if (!path) return { ok: false, reason: minKmh ? `Needs ${minKmh} km/h high-speed line between every stop` : 'Stops are not connected by track' };
+    const type = typeId ? TRAIN_TYPE_BY_ID.get(typeId) : undefined;
+    const path = this.net.routePath(stops, type ? routeMode(type) : {});
+    if (!path) {
+      if (type?.needsLineKmh) return { ok: false, reason: `Needs ${type.needsLineKmh} km/h high-speed line between every stop` };
+      if (type?.needsDfc) return { ok: false, reason: 'Needs a freight corridor between every stop' };
+      return { ok: false, reason: 'Stops are not connected by track' };
+    }
     return { ok: true, path, length: this.net.pathLength(path) };
   }
 
@@ -387,7 +433,10 @@ export class Game {
   removeTrain(id: string) {
     const t = this.trains.get(id);
     if (!t) return;
-    for (const e of this.net.edges.values()) e.occupants.delete(id);
+    for (const e of this.net.edges.values()) {
+      e.occupants.delete(id);
+      e.dfcOccupants.delete(id);
+    }
     this.book('sales', trainCost(t.type, t.cfg.coaches) * 0.4);
     this.trains.delete(id);
     this.refreshServedPairs();
@@ -414,6 +463,48 @@ export class Game {
       }
     }
     this.servedPairs = [...by.values()];
+
+    const flows = new Map<string, { o: string; d: string; c: Commodity; trains: number }>();
+    for (const t of this.trains.values()) {
+      if (!t.freight) continue;
+      const s = t.cfg.stops;
+      for (const c of COMMODITIES) {
+        if (!t.carriesCargo(c)) continue;
+        for (const o of s) for (const d of s) {
+          if (!flowWeight(c, o, d)) continue;
+          const k = `${o}>${d}>${c}`;
+          const f = flows.get(k);
+          if (f) f.trains++;
+          else flows.set(k, { o, d, c, trains: 1 });
+        }
+      }
+    }
+    this.freightFlows = [...flows.values()];
+  }
+
+  /** Tonnes per hour offered on a freight flow. */
+  flowTons(f: { o: string; d: string; c: Commodity; trains: number }): number {
+    return FREIGHT_PER_HOUR * flowWeight(f.c, f.o, f.d) * Math.pow(Math.min(6, f.trains), 0.3);
+  }
+
+  private spawnCargo(dt: number) {
+    for (const f of this.freightFlows) {
+      const so = this.stations.get(f.o)!;
+      const key = `${f.d}|${f.c}`;
+      const acc = (so.acc.get(key) ?? 0) + (this.flowTons(f) / 60) * dt;
+      const n = Math.floor(acc);
+      so.acc.set(key, acc - n);
+      if (n <= 0) continue;
+      const g = so.cargo.find((x) => x.dest === f.d && x.commodity === f.c);
+      if (g) g.tons = Math.min(MAX_CARGO_WAITING, g.tons + n);
+      else so.cargo.push({ commodity: f.c, origin: f.o, dest: f.d, tons: n, spawn: this.time });
+    }
+  }
+
+  cargoAt(id: string): number {
+    let n = 0;
+    for (const g of this.stations.get(id)!.cargo) n += g.tons;
+    return n;
   }
 
   /** Passengers per hour a served pair generates, before time of day and events. */
@@ -437,7 +528,10 @@ export class Game {
   private step(dt: number) {
     this.time += dt;
     this.spawnPassengers(dt);
+    this.spawnCargo(dt);
+    this.heldThisStep.clear();
     for (const t of this.trains.values()) this.stepTrain(t, dt);
+    this.measureLines(dt);
     this.chargeOperatingCosts(dt);
     this.updateResearch();
     this.updateWorks();
@@ -461,7 +555,9 @@ export class Game {
   private chargeOperatingCosts(dt: number) {
     for (const t of this.trains.values()) this.book('running', -t.runningCostPerHour * (dt / 60), t);
     let upkeep = 0;
-    for (const e of this.net.edges.values()) upkeep += km(e.length) * lineClass(e.kmh).upkeepPerKmDay * (e.tracks === 2 ? 1.6 : 1);
+    for (const e of this.net.edges.values()) {
+      upkeep += km(e.length) * (lineClass(e.kmh).upkeepPerKmDay * (e.tracks === 2 ? 1.6 : 1) + (e.dfc ? DFC.upkeepPerKmDay : 0));
+    }
     if (upkeep) this.book('upkeep', -upkeep * (dt / 1440));
   }
 
@@ -516,10 +612,26 @@ export class Game {
    * hold a reservation for the block their head is in, and loops/stations have
    * unlimited room, so the network cannot deadlock.
    */
+  /** Smoothed block use and signal holds per line, for the congestion view (≈2 h memory). */
+  private measureLines(dt: number) {
+    const k = Math.min(1, dt / 120);
+    for (const e of this.net.edges.values()) {
+      const use = e.occupants.size / (e.blocks * liveTracks(e));
+      e.util += (use - e.util) * k;
+      const held = ((this.heldThisStep.get(e) ?? 0) / dt) * 60;
+      e.held += (held - e.held) * k;
+    }
+  }
+
+  private noteHeld(t: Train, dt: number) {
+    const s = t.segs[t.seg];
+    if (s && !s.dfc) this.heldThisStep.set(s.edge, (this.heldThisStep.get(s.edge) ?? 0) + dt);
+  }
+
   private canEnter(s: Segment, t: Train): boolean {
-    for (const [id, o] of s.edge.occupants) {
+    for (const [id, o] of occupancy(s)) {
       if (id === t.cfg.id || o.block !== s.block) continue;
-      if (liveTracks(s.edge) === 1) return false;
+      if (!s.dfc && liveTracks(s.edge) === 1) return false;
       if (o.dir !== s.dir) continue;
       const other = this.trains.get(id);
       if (!other) continue;
@@ -531,13 +643,13 @@ export class Game {
   private reserve(t: Train, i: number): boolean {
     const s = t.segs[i];
     if (!this.canEnter(s, t)) return false;
-    s.edge.occupants.set(t.cfg.id, { dir: s.dir, block: s.block });
+    occupancy(s).set(t.cfg.id, { dir: s.dir, block: s.block });
     t.onSeg = true;
     return true;
   }
 
   private release(t: Train) {
-    if (t.onSeg) t.segs[t.seg].edge.occupants.delete(t.cfg.id);
+    if (t.onSeg) occupancy(t.segs[t.seg]).delete(t.cfg.id);
     t.onSeg = false;
   }
 
@@ -552,6 +664,7 @@ export class Game {
       if (!this.reserve(t, t.seg)) {
         t.holding = true;
         t.v = 0;
+        this.noteHeld(t, dt);
         return;
       }
     }
@@ -574,9 +687,9 @@ export class Game {
         if (s.end - t.pos <= brake && !this.canEnter(ns, t)) target = Math.min(target, s.end);
       }
       // keep distance behind a train ahead in the same block on double track
-      if (liveTracks(s.edge) === 2) {
+      if (s.dfc || liveTracks(s.edge) === 2) {
         const mine = t.pos - s.start;
-        for (const [id, o] of s.edge.occupants) {
+        for (const [id, o] of occupancy(s)) {
           if (id === t.cfg.id || o.dir !== s.dir || o.block !== s.block) continue;
           const other = this.trains.get(id)!;
           const theirs = other.pos - other.segs[other.seg].start;
@@ -615,14 +728,17 @@ export class Game {
     t.state = 'dwelling';
     const delay = Math.max(0, this.time - t.schedArr);
     t.delay = delay;
-    const onTime = delay <= ON_TIME_MIN;
-    this.recentArrivals.push(onTime);
-    if (this.recentArrivals.length > 60) this.recentArrivals.shift();
-    this.stats.arrivals++;
-    if (onTime) this.stats.onTimeArrivals++;
-    if (delay > 30) this.notify(`${t.cfg.number} reached ${city(stopId).name} ${Math.round(delay)} min late`, 'bad');
+    // freight runs to paths, not a public timetable, so it does not count towards punctuality
+    if (!t.freight) {
+      const onTime = delay <= ON_TIME_MIN;
+      this.recentArrivals.push(onTime);
+      if (this.recentArrivals.length > 60) this.recentArrivals.shift();
+      this.stats.arrivals++;
+      if (onTime) this.stats.onTimeArrivals++;
+      if (delay > 30) this.notify(`${t.cfg.number} reached ${city(stopId).name} ${Math.round(delay)} min late`, 'bad');
+    }
 
-    // alight
+    // alight / unload
     const keep: PaxGroup[] = [];
     let fares = 0;
     for (const g of t.passengers) {
@@ -630,9 +746,15 @@ export class Game {
       else keep.push(g);
     }
     t.passengers = keep;
+    const kept: CargoGroup[] = [];
+    for (const g of t.cargo) {
+      if (g.dest === stopId) fares += this.deliverCargo(t, g);
+      else kept.push(g);
+    }
+    t.cargo = kept;
     t.tripFares += fares;
     if (fares > 0) {
-      this.payouts.push({ trainId: t.cfg.id, cityId: stopId, amount: fares });
+      this.payouts.push({ trainId: t.cfg.id, cityId: stopId, amount: fares, freight: t.freight });
       if (this.payouts.length > 40) this.payouts.shift();
     }
     if (terminal) {
@@ -640,13 +762,12 @@ export class Game {
       t.tripFares = 0;
     }
 
-    const planned = terminal ? Train.TERMINAL_DWELL : Train.INTERMEDIATE_DWELL;
-    const min = terminal ? Train.MIN_TERMINAL_DWELL : Train.MIN_INTERMEDIATE_DWELL;
+    const { planned, min } = t.dwell(terminal);
     t.schedDep = t.schedArr + planned;
     if (terminal && delay > 45) {
       // badly late rakes get a fresh path at the terminal instead of staying late forever
       t.schedDep = this.time + min + 5;
-      this.notify(`${t.cfg.number} re-timed at ${city(stopId).name}, departs ${fmtClock(t.schedDep)}`);
+      if (!t.freight) this.notify(`${t.cfg.number} re-timed at ${city(stopId).name}, departs ${fmtClock(t.schedDep)}`);
     }
     t.dwellUntil = Math.max(this.time + min, t.schedDep);
     t.nextStop++;
@@ -676,6 +797,7 @@ export class Game {
   }
 
   private board(t: Train, stationId: string) {
+    if (t.freight) return this.loadCargo(t, stationId);
     const st = this.stations.get(stationId)!;
     if (!st.waiting.length) return;
     const ahead = new Set<string>();
@@ -692,6 +814,34 @@ export class Game {
       } else keep.push(g);
     }
     st.waiting = keep;
+  }
+
+  private loadCargo(t: Train, stationId: string) {
+    const st = this.stations.get(stationId)!;
+    if (!st.cargo.length) return;
+    const ahead = new Set<string>();
+    for (let k = t.nextStop; k < t.stopIdx.length; k++) ahead.add(t.path[t.stopIdx[k]]);
+    let free = t.capacity - t.load;
+    // load the best-paying consignments first: long hauls of high-value goods
+    const value = (g: CargoGroup) => COMMODITY_INFO[g.commodity].rate * distance(g.origin, g.dest);
+    const order = [...st.cargo].sort((a, b) => value(b) - value(a));
+    for (const g of order) {
+      if (free <= 0) break;
+      if (!ahead.has(g.dest) || !t.carriesCargo(g.commodity)) continue;
+      const n = Math.min(free, g.tons);
+      free -= n;
+      g.tons -= n;
+      t.cargo.push({ ...g, tons: n });
+    }
+    st.cargo = st.cargo.filter((g) => g.tons > 0);
+  }
+
+  /** Freight charge for a consignment delivered; it is booked as freight income. */
+  private deliverCargo(t: Train, g: CargoGroup): number {
+    const revenue = g.tons * km(distance(g.origin, g.dest)) * 1.1 * COMMODITY_INFO[g.commodity].rate;
+    this.book('freight', revenue, t);
+    this.stats.freightTons += g.tons;
+    return revenue;
   }
 
   /** Hand a group over at its destination; returns the fares it paid. */
@@ -803,7 +953,7 @@ export class Game {
       hW: this.hW,
       recent: this.recentArrivals,
       nextTrainNum: this.nextTrainNum,
-      edges: [...this.net.edges.values()].map((e) => [e.a, e.b, e.tracks, e.kmh, e.works]),
+      edges: [...this.net.edges.values()].map((e) => [e.a, e.b, e.tracks, e.kmh, e.works, e.dfc]),
       research: { done: [...this.research.done], active: this.research.active },
       trains: [...this.trains.values()].map((t) => t.cfg),
       ledger: this.ledger.toJSON(),
@@ -831,7 +981,7 @@ export class Game {
       g.time = d.time;
       g.funds = d.funds;
       g.score = d.score;
-      g.stats = d.stats;
+      g.stats = { freightTons: 0, ...d.stats };
       g.hSum = d.hSum;
       g.hW = d.hW;
       g.recentArrivals = d.recent ?? [];
@@ -839,7 +989,7 @@ export class Game {
       g.lastHour = Math.floor(g.time / 60);
       g.nextEventAt = g.time + 12 * 60;
       g.ledger = Ledger.from(d.ledger, g.time);
-      for (const [a, b, tracks, kmh, works] of d.edges) g.net.addEdge(a, b, tracks, kmh ?? 110).works = works ?? null;
+      for (const [a, b, tracks, kmh, works, dfc] of d.edges) g.net.addEdge(a, b, tracks, kmh ?? 110, !!dfc).works = works ?? null;
       g.research = { done: new Set(d.research?.done ?? []), active: d.research?.active ?? null };
       for (const cfg of d.trains as TrainConfig[]) {
         const t = new Train(cfg);

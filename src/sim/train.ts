@@ -1,7 +1,9 @@
-import { CAR, PaxClass, TRAIN_TYPE_BY_ID, TrainType, trainCapacity, trainLength } from '../data/trainTypes';
+import { CAR, PaxClass, TRAIN_TYPE_BY_ID, TrainType, isFreight, trainCapacity, trainLength, vehicleLen } from '../data/trainTypes';
+import type { Commodity } from '../data/freight';
+import { DFC, dfcOffset } from '../data/research';
 import { KM_PER_UNIT } from '../data/geo';
 import { city } from '../data/cities';
-import { Network, TrackEdge, km, lineKmh, liveTracks } from './network';
+import { Network, TrackEdge, km, lineKmh, liveTracks, routeMode } from './network';
 import { Ledger } from './ledger';
 
 export interface TrainConfig {
@@ -23,6 +25,15 @@ export interface PaxGroup {
   loadAtBoard: number; // load factor (vs seats) when departing
 }
 
+/** Freight waiting at a station or riding in a train. */
+export interface CargoGroup {
+  commodity: Commodity;
+  origin: string;
+  dest: string;
+  tons: number;
+  spawn: number;
+}
+
 export type TrainState = 'dwelling' | 'running';
 
 /** One signal block along a train's path. */
@@ -33,13 +44,19 @@ export interface Segment {
   start: number; // distance along path
   end: number;
   node: number; // path index of the node this edge starts from
+  dfc: boolean; // freight running on the corridor alongside, with its own signalling
 }
 
 const INTERMEDIATE_DWELL = 5;
 const TERMINAL_DWELL = 30;
 const MIN_INTERMEDIATE_DWELL = 2;
 const MIN_TERMINAL_DWELL = 12;
+// freight stops to load and unload
+const FREIGHT_INTERMEDIATE_DWELL = 20;
+const FREIGHT_TERMINAL_DWELL = 45;
 export const ON_TIME_MIN = 5;
+
+const smooth = (t: number) => t * t * (3 - 2 * t);
 
 /** km/h → world units per game minute */
 export function kmhToUpm(kmh: number): number {
@@ -69,6 +86,7 @@ export class Train {
   delay = 0; // minutes, at last stop
   holding = false; // waiting for a signal (blocked edge)
   passengers: PaxGroup[] = [];
+  cargo: CargoGroup[] = [];
   tripStartedAt = 0;
   /** Fares and running costs booked to this train. */
   money: Ledger;
@@ -79,7 +97,7 @@ export class Train {
     const t = TRAIN_TYPE_BY_ID.get(cfg.typeId);
     if (!t) throw new Error(`Unknown train type ${cfg.typeId}`);
     this.type = t;
-    this.length = trainLength(cfg.coaches);
+    this.length = trainLength(t, cfg.coaches);
     this.capacity = trainCapacity(t, cfg.coaches);
     this.money = new Ledger(0);
   }
@@ -88,10 +106,26 @@ export class Train {
     return this.type.seatsPerCoach * this.cfg.coaches;
   }
 
+  get freight(): boolean {
+    return isFreight(this.type);
+  }
+
+  /** Passengers aboard, or tonnes for a freight train. */
   get load(): number {
     let n = 0;
-    for (const g of this.passengers) n += g.count;
+    if (this.freight) for (const g of this.cargo) n += g.tons;
+    else for (const g of this.passengers) n += g.count;
     return n;
+  }
+
+  carriesCargo(c: Commodity): boolean {
+    return !!this.type.cargo?.includes(c);
+  }
+
+  /** Planned stop lengths: freight takes longer to load. */
+  dwell(terminal: boolean): { planned: number; min: number } {
+    if (this.freight) return terminal ? { planned: FREIGHT_TERMINAL_DWELL, min: 25 } : { planned: FREIGHT_INTERMEDIATE_DWELL, min: 10 };
+    return terminal ? { planned: TERMINAL_DWELL, min: MIN_TERMINAL_DWELL } : { planned: INTERMEDIATE_DWELL, min: MIN_INTERMEDIATE_DWELL };
   }
 
   get cruise(): number {
@@ -121,7 +155,7 @@ export class Train {
 
   /** Top speed on a line right now (train or line limit, whichever is lower), units/min. */
   vmaxOn(e: TrackEdge): number {
-    return Math.min(this.cruise, kmhToUpm(lineKmh(e)));
+    return Math.min(this.cruise, kmhToUpm(this.freight && e.dfc ? DFC.kmh : lineKmh(e)));
   }
 
   /**
@@ -145,7 +179,7 @@ export class Train {
     let t = 0;
     for (let k = 1; k < this.stopIdx.length; k++) {
       t += this.legTime(net, this.stopIdx[k - 1], this.stopIdx[k]);
-      if (k < this.stopIdx.length - 1) t += INTERMEDIATE_DWELL;
+      if (k < this.stopIdx.length - 1) t += this.dwell(false).planned;
     }
     return t;
   }
@@ -154,11 +188,11 @@ export class Train {
   serviceKmh = 0;
 
   carries(cls: PaxClass): boolean {
-    return this.type.fares[cls] !== undefined;
+    return !this.freight && this.type.fares[cls] !== undefined;
   }
 
   buildPath(net: Network): boolean {
-    const p = net.routePath(this.dirStops, this.type.needsLineKmh ?? 0);
+    const p = net.routePath(this.dirStops, routeMode(this.type));
     if (!p) return false;
     this.path = p;
     this.cum = [0];
@@ -170,7 +204,7 @@ export class Train {
       const bl = e.length / e.blocks;
       for (let k = 0; k < e.blocks; k++) {
         this.segs.push({
-          edge: e, dir, node: i - 1,
+          edge: e, dir, node: i - 1, dfc: this.freight && e.dfc,
           block: dir === 1 ? k : e.blocks - 1 - k,
           start: start + k * bl,
           end: k === e.blocks - 1 ? start + e.length : start + (k + 1) * bl,
@@ -247,10 +281,16 @@ export class Train {
     let z = a.z + (b.z - a.z) * t;
     // left-hand running on double track, easing to centre at stations
     const e = net.edge(p[i], p[i + 1]);
-    if (e && liveTracks(e) === 2) {
-      const along = d - this.cum[i];
-      const ease = Math.min(1, Math.max(0, Math.min(along, len - along) / 4));
-      const off = CAR.lane * ease * ease * (3 - 2 * ease);
+    const along = d - this.cum[i];
+    const near = Math.min(along, len - along);
+    if (e && this.freight && e.dfc) {
+      // the corridor runs alongside on the line's +x side (in a→b terms) and joins it at stations
+      const ease = smooth(Math.min(1, Math.max(0, (near - 2) / 6)));
+      const side = (p[i] === e.a ? 1 : -1) * dfcOffset(e.tracks) * ease + CAR.lane * smooth(Math.min(1, Math.max(0, near / 4)));
+      x += dz * side;
+      z += -dx * side;
+    } else if (e && liveTracks(e) === 2) {
+      const off = CAR.lane * smooth(Math.min(1, Math.max(0, near / 4)));
       x += dz * off;
       z += -dx * off;
     }
@@ -262,12 +302,13 @@ export class Train {
   /** Centre distances of each car from the head, front to back. */
   carOffsets(): { center: number; len: number; power: boolean }[] {
     const cars: { center: number; len: number; power: boolean }[] = [];
+    const v = vehicleLen(this.type);
     let d = 0;
     cars.push({ center: d + CAR.powerLen / 2, len: CAR.powerLen, power: true });
-    d += CAR.powerLen + CAR.gap;
+    d += CAR.powerLen + v.gap;
     for (let i = 0; i < this.cfg.coaches; i++) {
-      cars.push({ center: d + CAR.coachLen / 2, len: CAR.coachLen, power: false });
-      d += CAR.coachLen + CAR.gap;
+      cars.push({ center: d + v.len / 2, len: v.len, power: false });
+      d += v.len + v.gap;
     }
     cars.push({ center: d + CAR.powerLen / 2, len: CAR.powerLen, power: true });
     return cars;

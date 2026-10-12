@@ -2,6 +2,9 @@ import { city } from '../data/cities';
 import { km } from '../sim/network';
 import { LINE_CLASSES, RESEARCH, RESEARCH_BY_ID, WORKS_SPEED, lineClass } from '../data/research';
 import { PAX_CLASSES, PAX_CLASS_INFO, TRAIN_TYPES } from '../data/trainTypes';
+import { COMMODITY_INFO, cityFreight } from '../data/freight';
+import { DFC } from '../data/research';
+import { lineLoad } from '../render/tracks';
 import { ON_TIME_MIN } from '../sim/train';
 import type { Game } from '../sim/game';
 import type { Bucket } from '../sim/ledger';
@@ -114,6 +117,7 @@ export class Inspector {
               h('div', { class: 'row' }, city(d).name, h('span', { class: 'r' }, `${fmt.int(v.n)} · ${fmt.dur(g.time - v.oldest)}`))))
             : h('div', { class: 'empty' }, trains.length ? 'Platforms are clear.' : 'Passengers appear once a train serves this station.'),
         ),
+        this.cityFreight(id),
         h('div', { class: 'section' },
           h('div', { class: 'lbl' }, 'Services'),
           trains.length
@@ -130,6 +134,26 @@ export class Inspector {
         ),
       ),
     ];
+  }
+
+  private cityFreight(id: string): HTMLElement | string {
+    const g = this.host.game;
+    const st = g.stations.get(id)!;
+    const { loads, receives } = cityFreight(id);
+    if (!loads.length && !receives.length) return '';
+    const names = (cs: typeof loads) => cs.map((c) => COMMODITY_INFO[c].name).join(', ');
+    return h('div', { class: 'section' },
+      h('div', { class: 'lbl' }, 'Freight'),
+      h('div', { class: 'kv' },
+        loads.length ? h('span', null, 'Loads') : '', loads.length ? h('span', null, names(loads)) : '',
+        receives.length ? h('span', null, 'Receives') : '', receives.length ? h('span', null, names(receives)) : '',
+      ),
+      st.cargo.length
+        ? h('div', { class: 'list', style: 'margin-top:8px' }, [...st.cargo].sort((a, b) => b.tons - a.tons).slice(0, 6).map((c) =>
+          h('div', { class: 'row' }, h('span', { class: 'sw', style: `background:${COMMODITY_INFO[c.commodity].color}` }),
+            `${COMMODITY_INFO[c.commodity].name} → ${city(c.dest).name}`, h('span', { class: 'r' }, `${fmt.int(c.tons)} t`))))
+        : h('p', { class: 'hint' }, loads.length ? 'Run a goods train from here to a station that receives these to start earning freight.' : 'Bring freight here from the stations that load it.'),
+    );
   }
 
   private train(id: string): HTMLElement[] {
@@ -157,18 +181,24 @@ export class Inspector {
           h('div', { style: 'display:flex;gap:8px;align-items:center;margin-bottom:10px' }, status,
             h('span', { style: 'font-size:12px;color:var(--ink-2)' }, doing)),
           h('div', { class: 'kv' },
-            h('span', null, 'Type'), h('span', null, `${t.type.short} · ${t.cfg.coaches} coaches`),
-            h('span', null, 'Carries'), h('span', null, PAX_CLASSES.filter((c) => t.carries(c)).map((c) => PAX_CLASS_INFO[c].name).join(', ')),
+            h('span', null, 'Type'), h('span', null, `${t.type.short} · ${t.cfg.coaches} ${t.freight ? 'wagons' : 'coaches'}`),
+            h('span', null, 'Carries'), h('span', null, t.freight
+              ? t.type.cargo!.map((c) => COMMODITY_INFO[c].name).join(', ')
+              : PAX_CLASSES.filter((c) => t.carries(c)).map((c) => PAX_CLASS_INFO[c].name).join(', ')),
             h('span', null, 'Speed'), h('span', null, `${Math.round(km(t.v) * 60)} km/h`),
             h('span', null, 'Average speed'), h('span', null, `${Math.round(t.serviceKmh)} km/h`),
           ),
         ),
         h('div', { class: 'section' },
-          h('div', { class: 'lbl', style: 'justify-content:space-between' }, 'Load', h('span', null, `${fmt.int(load)} / ${fmt.int(t.seats)} seats`)),
+          h('div', { class: 'lbl', style: 'justify-content:space-between' }, 'Load', h('span', null, t.freight ? `${fmt.int(load)} / ${fmt.int(t.capacity)} t` : `${fmt.int(load)} / ${fmt.int(t.seats)} seats`)),
           h('div', { class: 'loadbar' },
             h('i', { class: pct > 100 ? 'over' : '', style: `width:${Math.min(100, (pct / scale) * 100)}%` }),
             maxPct > 100 ? h('span', { class: 'seat', style: `left:${(100 / scale) * 100}%` }) : null,
           ),
+          t.freight && t.cargo.length ? h('div', { class: 'list', style: 'margin-top:8px' }, t.cargo.map((c) =>
+            h('div', { class: 'row' }, h('span', { class: 'sw', style: `background:${COMMODITY_INFO[c.commodity].color}` }),
+              `${COMMODITY_INFO[c.commodity].name} → ${city(c.dest).name}`, h('span', { class: 'r' }, `${fmt.int(c.tons)} t`)))) : '',
+          t.freight && !t.cargo.length ? h('p', { class: 'hint' }, 'Running empty. Coal and ore trains usually come back empty; containers fill both ways.') : '',
         ),
         this.trainMoney(t),
         h('div', { class: 'section' },
@@ -196,14 +226,15 @@ export class Inspector {
   private trainMoney(t: Train): HTMLElement {
     const g = this.host.game;
     const day = t.money.window(g.time, 24);
-    const profit = day.fares + day.running;
+    const income = day.fares + day.freight;
+    const profit = income + day.running;
     const young = g.time - t.money.since < 24 * 60;
     return h('div', { class: 'section' },
       h('div', { class: 'lbl', style: 'justify-content:space-between' },
         young ? 'Earnings since entering service' : 'Earnings · last 24 h',
         h('span', { class: profit >= 0 ? 'pos' : 'neg' }, fmt.money(profit, true))),
       h('div', { class: 'kv' },
-        h('span', null, 'Fares collected'), h('span', { class: 'pos' }, fmt.money(day.fares, true)),
+        h('span', null, t.freight ? 'Freight charges' : 'Fares collected'), h('span', { class: 'pos' }, fmt.money(income, true)),
         h('span', null, 'Running costs'), h('span', { class: 'neg' }, fmt.money(day.running)),
         h('span', null, 'Costs per hour'), h('span', null, fmt.money(t.runningCostPerHour)),
         h('span', null, 'This run so far'), h('span', null, fmt.money(t.tripFares, true)),
@@ -219,7 +250,7 @@ export class Inspector {
     const g = this.host.game;
     const L = g.ledger;
     const day = L.window(g.time, 24);
-    const operating = day.fares + day.running + day.upkeep;
+    const operating = day.fares + day.freight + day.running + day.upkeep;
     const invested = day.track + day.trains + day.research;
     const net = operating + invested + day.sales;
     const rate = L.operatingRate(g.time);
@@ -227,7 +258,7 @@ export class Inspector {
     const trains = [...g.trains.values()]
       .map((t) => {
         const w = t.money.window(g.time, 24);
-        return { t, fares: w.fares, running: w.running, profit: w.fares + w.running };
+        return { t, fares: w.fares + w.freight, running: w.running, profit: w.fares + w.freight + w.running };
       })
       .sort((a, b) => b.profit - a.profit);
     const sign = (n: number) => (n >= 0 ? 'pos' : 'neg');
@@ -237,25 +268,26 @@ export class Inspector {
       h('div', { class: 'scroll' },
         h('div', { class: 'section' },
           h('div', { class: 'money-hero' },
-            h('div', null, h('div', { class: 'lbl' }, 'Profit per hour'), h('div', { class: `big ${sign(rate)}` }, `${fmt.money(rate, true)}`), h('div', { class: 'note' }, 'fares minus running costs, last 6 h')),
+            h('div', null, h('div', { class: 'lbl' }, 'Profit per hour'), h('div', { class: `big ${sign(rate)}` }, `${fmt.money(rate, true)}`), h('div', { class: 'note' }, 'fares and freight minus running costs and upkeep, last 6 h')),
             h('div', null, h('div', { class: 'lbl' }, 'Balance'), h('div', { class: `big ${g.funds < 0 ? 'neg' : ''}` }, fmt.money(g.funds))),
           ),
           h('p', { class: 'hint' },
             g.trains.size
               ? rate >= 0
-                ? 'Fares are covering your running costs. Spend the surplus on track and trains.'
-                : 'Running costs are outpacing fares, so your balance will slowly fall. See which trains are losing money below.'
-              : 'You are not earning anything yet. Lay track and run a train to start collecting fares.'),
+                ? 'Income is covering your running costs. Spend the surplus on track, trains and research.'
+                : 'Running costs are outpacing income, so your balance will slowly fall. See which trains are losing money below.'
+              : 'You are not earning anything yet. Lay track and run a passenger or goods train to start earning.'),
         ),
         h('div', { class: 'section' },
           h('div', { class: 'lbl' }, 'Last 24 hours, by hour'),
           chart(L.series(g.time, 24)),
-          h('div', { class: 'legend' }, h('span', null, h('i', { class: 'pos' }), 'Fares in'), h('span', null, h('i', { class: 'neg' }), 'Running costs out')),
+          h('div', { class: 'legend' }, h('span', null, h('i', { class: 'pos' }), 'Passenger fares'), h('span', null, h('i', { class: 'frt' }), 'Freight'), h('span', null, h('i', { class: 'neg' }), 'Running costs')),
         ),
         h('div', { class: 'section' },
           h('div', { class: 'lbl' }, 'Last 24 hours'),
           h('div', { class: 'kv' },
-            h('span', null, 'Fares'), h('span', { class: 'pos' }, fmt.money(day.fares, true)),
+            h('span', null, 'Passenger fares'), h('span', { class: 'pos' }, fmt.money(day.fares, true)),
+            h('span', null, 'Freight'), h('span', { class: 'pos' }, fmt.money(day.freight, true)),
             h('span', null, 'Running costs'), h('span', { class: 'neg' }, fmt.money(day.running)),
             h('span', null, 'Track upkeep'), h('span', { class: 'neg' }, fmt.money(day.upkeep)),
             h('span', null, 'Operating profit'), h('span', { class: `strong ${sign(operating)}` }, fmt.money(operating, true)),
@@ -274,7 +306,7 @@ export class Inspector {
                 h('span', { class: 'sw', style: `background:${t.type.accent}` }),
                 h('div', null,
                   h('div', null, `${t.cfg.number} ${t.cfg.name}`),
-                  h('div', { class: 'meta' }, `fares ${fmt.money(fares)} · running ${fmt.money(-running)}`)),
+                  h('div', { class: 'meta' }, `${t.freight ? 'freight' : 'fares'} ${fmt.money(fares)} · running ${fmt.money(-running)}`)),
                 h('span', { class: `r ${sign(profit)}` }, fmt.money(profit, true)))))
             : h('div', { class: 'empty' }, 'No trains in service.'),
         ),
@@ -282,6 +314,7 @@ export class Inspector {
           h('div', { class: 'lbl' }, 'How money works'),
           h('ul', { class: 'explain' },
             h('li', null, h('b', null, 'Fares'), ' are paid when passengers get off: more for longer trips and premium trains. You will see ', h('b', { class: 'pos' }, '+₹'), ' pop up at the station.'),
+            h('li', null, h('b', null, 'Freight'), ' pays when cargo is unloaded, by tonne and distance. It earns far more than general-class passengers, as on the real Indian Railways, but slow goods trains hold up passenger trains on shared lines.'),
             h('li', null, h('b', null, 'Running costs'), ' are charged every minute a train is in service, full or empty. Each coach adds to it.'),
             h('li', null, h('b', null, 'Track upkeep'), ' is charged for every km you own, more for double and faster lines. Lines nobody uses still cost money.'),
             h('li', null, h('b', null, 'Track and trains'), ' are one-off purchases. Removing them refunds part of the price.'),
@@ -290,7 +323,8 @@ export class Inspector {
         h('div', { class: 'section' },
           h('div', { class: 'lbl' }, 'All time'),
           h('div', { class: 'kv' },
-            h('span', null, 'Fares'), h('span', { class: 'pos' }, fmt.money(L.total.fares, true)),
+            h('span', null, 'Passenger fares'), h('span', { class: 'pos' }, fmt.money(L.total.fares, true)),
+            h('span', null, 'Freight'), h('span', { class: 'pos' }, fmt.money(L.total.freight, true)),
             h('span', null, 'Running costs'), h('span', { class: 'neg' }, fmt.money(L.total.running)),
             h('span', null, 'Upkeep'), h('span', { class: 'neg' }, fmt.money(L.total.upkeep)),
             h('span', null, 'Invested'), h('span', null, fmt.money(L.total.track + L.total.trains + L.total.research)),
@@ -306,6 +340,7 @@ export class Inspector {
     const users = g.trainsUsingEdge(id);
     const cls = lineClass(e.kmh);
     const up = g.upgradeInfo(id);
+    const dfc = g.dfcInfo(id);
     const dbl = g.doubleInfo(id);
     const w = e.works;
     const div = w || users.length ? g.diversions(id) : null;
@@ -321,15 +356,17 @@ export class Inspector {
             h('span', null, 'Signal blocks'), h('span', null, `${e.blocks}${e.tracks === 1 && e.blocks > 1 ? ` · ${e.blocks - 1} crossing loop${e.blocks > 2 ? 's' : ''}` : ''}`),
             h('span', null, 'Condition'), h('span', null, e.speedFactor < 1 ? `Restricted ${Math.round(e.speedFactor * 100)}%` : 'Normal'),
             h('span', null, 'Occupied'), h('span', null, e.occupants.size ? `${e.occupants.size} train${e.occupants.size > 1 ? 's' : ''}` : 'Clear'),
-            h('span', null, 'Upkeep'), h('span', null, `${fmt.money(km(e.length) * cls.upkeepPerKmDay * (e.tracks === 2 ? 1.6 : 1))} / day`),
+            h('span', null, 'Freight corridor'), h('span', null, e.dfc ? 'Yes, freight runs separately' : 'No'),
+            h('span', null, 'Traffic'), h('span', { class: lineLoad(e) > 0.75 ? 'neg' : '' }, `${lineLoad(e) > 0.75 ? 'Congested' : lineLoad(e) > 0.45 ? 'Busy' : 'Light'} · ${Math.round(e.util * 100)}% of blocks in use${e.held >= 1 ? ` · trains held ${Math.round(e.held)} min/h` : ''}`),
+            h('span', null, 'Upkeep'), h('span', null, `${fmt.money(km(e.length) * (cls.upkeepPerKmDay * (e.tracks === 2 ? 1.6 : 1) + (e.dfc ? DFC.upkeepPerKmDay : 0)))} / day`),
           ),
         ),
         w ? h('div', { class: 'section works' },
           h('div', { class: 'lbl', style: 'justify-content:space-between' },
-            w.kind === 'upgrade' ? `Works: upgrading to ${w.toKmh} km/h` : 'Works: doubling the line',
+            w.kind === 'upgrade' ? `Works: upgrading to ${w.toKmh} km/h` : w.kind === 'dfc' ? 'Works: freight corridor' : 'Works: doubling the line',
             h('span', null, `done ${fmt.clock(w.end)} day ${fmt.day(w.end)}`)),
           h('div', { class: 'loadbar works-bar' }, h('i', { style: `width:${pct}%` })),
-          h('p', { class: 'hint' }, `Trains are limited to ${Math.round(e.kmh * WORKS_SPEED)} km/h through the site`,
+          w.kind === 'dfc' ? h('p', { class: 'hint' }, 'Built alongside the running line, so traffic keeps moving normally.') : h('p', { class: 'hint' }, `Trains are limited to ${Math.round(e.kmh * WORKS_SPEED)} km/h through the site`,
             w.kind === 'upgrade' && e.tracks === 2 ? ' and share one track while the other is relaid.' : '.',
             !users.length ? ' All trains are diverting via other lines.'
               : div && div.stuck.length ? h('b', { class: 'neg' }, ` ${div.stuck.length} train${div.stuck.length > 1 ? 's have' : ' has'} no other way round.`)
@@ -345,7 +382,7 @@ export class Inspector {
                 div?.stuck.includes(t) && w ? h('span', { class: 'r neg' }, 'no diversion') : null)))
             : h('div', { class: 'empty' }, 'None'),
         ),
-        !w && (up.toKmh || dbl.cost) ? h('div', { class: 'section' },
+        !w && (up.toKmh || dbl.cost || !e.dfc) ? h('div', { class: 'section' },
           h('div', { class: 'lbl' }, 'Improve this line'),
           div && div.users.length
             ? h('p', { class: 'hint', style: 'margin:0 0 8px' }, 'Works slow the line for days. ',
@@ -362,6 +399,10 @@ export class Inspector {
             class: 'btn wide', disabled: !dbl.ok, title: dbl.reason ?? '',
             onclick: () => g.upgradeTrack(id),
           }, dbl.ok ? `Double the line · ${fmt.cr(dbl.cost!)} · ${days(dbl.hours!)}` : `Double: ${dbl.reason}`) : null,
+          !e.dfc ? h('button', {
+            class: 'btn wide', disabled: !dfc.ok, title: dfc.reason ?? '',
+            onclick: () => g.buildDfc(id),
+          }, dfc.ok ? `Build freight corridor alongside · ${fmt.cr(dfc.cost!)} · ${days(dfc.hours!)}, no disruption` : `Freight corridor: ${dfc.reason}`) : null,
         ) : null,
         h('div', { class: 'btnrow' },
           h('button', {
@@ -417,11 +458,11 @@ export class Inspector {
   }
 }
 
-/** Hourly bars: fares above the line, running costs below it. */
+/** Hourly bars: fares and freight above the line, running costs below it. */
 function chart(series: Bucket[]): HTMLElement {
   const W = 336;
   const H = 104;
-  const up = Math.max(0.01, ...series.map((b) => b.fares));
+  const up = Math.max(0.01, ...series.map((b) => b.fares + b.freight));
   const down = Math.max(0.01, ...series.map((b) => -b.running));
   const base = Math.round(Math.min(H - 18, Math.max(18, (H * up) / (up + down))));
   const bw = W / series.length;
@@ -429,8 +470,10 @@ function chart(series: Bucket[]): HTMLElement {
     const x = (i * bw + 1).toFixed(1);
     const w = (bw - 2).toFixed(1);
     const hu = (b.fares / up) * (base - 2);
+    const hf = (b.freight / up) * (base - 2);
     const hd = (-b.running / down) * (H - base - 2);
     return `<rect x="${x}" y="${(base - hu).toFixed(1)}" width="${w}" height="${hu.toFixed(1)}" fill="var(--green)"/>`
+      + `<rect x="${x}" y="${(base - hu - hf).toFixed(1)}" width="${w}" height="${hf.toFixed(1)}" fill="var(--freight)"/>`
       + `<rect x="${x}" y="${base}" width="${w}" height="${hd.toFixed(1)}" fill="var(--red)" opacity=".75"/>`;
   }).join('');
   const el = h('div', { class: 'chart' });

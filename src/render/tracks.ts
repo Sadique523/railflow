@@ -4,7 +4,7 @@ import { CAR } from '../data/trainTypes';
 import { BOX, COLORS } from './palette';
 import { GeoBuilder, PRIM, VCOL } from './batch';
 import { PAL } from './models';
-import { lineClass } from '../data/research';
+import { DFC, dfcOffset, lineClass } from '../data/research';
 import type { Game } from '../sim/game';
 import type { TrackEdge } from '../sim/network';
 
@@ -166,29 +166,52 @@ function buildEdgeGeometry(e: TrackEdge): { geo: THREE.BufferGeometry; len: numb
     if (e.tracks === 2) platform(b, -px, pz0, pz1, -1);
     trainShed(b, e.tracks === 2 ? -px - 0.7 : -0.95, px + 0.7, pz0 - 0.4, pz1 + 0.4);
   }
-  if (e.works) worksSite(b, e.works.kind, fw, z0 + halfA + 4, z1 - halfB - 4);
+  if (e.dfc) freightCorridor(b, dfcOffset(e.tracks), z0, z1);
+  if (e.works) worksSite(b, e.works.kind, fw, z0 + halfA + 4, z1 - halfB - 4, dfcOffset(e.tracks));
   return { geo: b.build(), len };
 }
 
+/** Double-track freight corridor on the line's +x side, swinging in to join it near each station. */
+function freightCorridor(b: GeoBuilder, x: number, z0: number, z1: number) {
+  const s0 = z0 + 8;
+  const s1 = z1 - 8;
+  if (s1 - s0 < 2) return;
+  b.box(DFC.color, x, 0.04, (s0 + s1) / 2, formationWidth(2), 0.08, s1 - s0);
+  for (const lx of [-CAR.lane, CAR.lane]) lane(b, x + lx, s0, s1);
+  for (const [zs, zj] of [[s0, z0 + 2], [s1, z1 - 2]]) {
+    // connecting curve: a formation strip and the two tracks running in on the diagonal
+    const len = Math.hypot(x, zs - zj);
+    const ang = Math.atan2(x, zs - zj);
+    b.box(DFC.color, x / 2, 0.035, (zs + zj) / 2, formationWidth(2) * 0.8, 0.07, len, ang);
+    for (const lx of [-CAR.lane, CAR.lane]) diagonal(b, x + lx, zs, lx * 0.4, zj);
+  }
+}
+
 /** Barriers along the line and work machines dotted along it. */
-function worksSite(b: GeoBuilder, kind: 'upgrade' | 'double', fw: number, z0: number, z1: number) {
+function worksSite(b: GeoBuilder, kind: 'upgrade' | 'double' | 'dfc', fw: number, z0: number, z1: number, dfcX: number) {
   if (z1 - z0 < 4) return;
-  const side = fw / 2 + 0.35;
+  let side = fw / 2 + 0.35;
   if (kind === 'double') {
     // the new formation being laid alongside
     b.box(PAL.ballast, side + 0.55, 0.05, (z0 + z1) / 2, 1.1, 0.1, z1 - z0);
   }
+  if (kind === 'dfc') {
+    // the corridor's earthworks alongside; barriers fence it off from the running line
+    b.box(PAL.ballast, dfcX, 0.05, (z0 + z1) / 2, formationWidth(2), 0.1, z1 - z0);
+    side = dfcX - formationWidth(2) / 2 - 0.3;
+  }
   const n = Math.max(2, Math.floor((z1 - z0) / 2.4));
   for (let i = 0; i <= n; i++) {
     const z = z0 + ((z1 - z0) * i) / n;
-    for (const x of [-side, side + (kind === 'double' ? 1.2 : 0)]) {
+    const xs = kind === 'dfc' ? [side, dfcX + formationWidth(2) / 2 + 0.3] : [-side, side + (kind === 'double' ? 1.2 : 0)];
+    for (const x of xs) {
       b.block(i % 2 ? PAL.dark : PAL.yellow, x, 0.08, z, 0.12, 0.32, 0.9);
     }
   }
   const machines = Math.max(1, Math.floor((z1 - z0) / 26));
   for (let i = 0; i < machines; i++) {
     const z = z0 + ((z1 - z0) * (i + 0.5)) / machines;
-    const x = side + 0.7;
+    const x = kind === 'dfc' ? dfcX : side + 0.7;
     b.block(PAL.yellow, x, 0.08, z, 0.7, 0.42, 1.5);
     b.block(PAL.dark, x, 0.5, z - 0.35, 0.55, 0.32, 0.5);
     b.box(PAL.yellow, x - 0.35, 0.95, z + 0.2, 0.08, 0.08, 1.3, 0, 0.6);
@@ -201,9 +224,11 @@ export class TrackView {
   private views = new Map<string, { key: string; mesh: THREE.Mesh }>();
   private ghost: THREE.Mesh;
   private highlight = new THREE.Group();
+  private congestion = new THREE.Group();
+  private congestionBars = new Map<string, THREE.Mesh>();
 
   constructor(scene: THREE.Scene) {
-    scene.add(this.group, this.highlight);
+    scene.add(this.group, this.highlight, this.congestion);
     this.ghost = new THREE.Mesh(
       BOX,
       new THREE.MeshBasicMaterial({ color: COLORS.yellow, transparent: true, opacity: 0.55, depthWrite: false }),
@@ -213,7 +238,7 @@ export class TrackView {
   }
 
   sync(game: Game) {
-    const keyOf = (e: TrackEdge) => `${e.tracks}|${e.kmh}|${e.works?.kind ?? ''}`;
+    const keyOf = (e: TrackEdge) => `${e.tracks}|${e.kmh}|${e.dfc}|${e.works?.kind ?? ''}`;
     for (const [id, v] of this.views) {
       const e = game.net.edges.get(id);
       if (!e || keyOf(e) !== v.key) {
@@ -245,6 +270,38 @@ export class TrackView {
     this.ghost.rotation.y = Math.atan2(to.x - a.x, to.z - a.z);
     this.ghost.scale.set(formationWidth(1), 0.06, len);
     (this.ghost.material as THREE.MeshBasicMaterial).color.set(ok ? COLORS.yellow : 0xd0423f);
+  }
+
+  /**
+   * Congestion view: a bar over every line, green when quiet, yellow when busy and red when
+   * trains queue for it. `width` keeps the bars readable from any zoom.
+   */
+  showCongestion(game: Game | null, width = 1.6) {
+    this.congestion.visible = !!game;
+    if (!game) return;
+    for (const [id, bar] of this.congestionBars) {
+      if (!game.net.edges.has(id)) {
+        this.congestion.remove(bar);
+        (bar.material as THREE.Material).dispose();
+        this.congestionBars.delete(id);
+      }
+    }
+    for (const e of game.net.edges.values()) {
+      let bar = this.congestionBars.get(e.id);
+      if (!bar) {
+        const a = city(e.a);
+        const b = city(e.b);
+        bar = new THREE.Mesh(BOX, new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.85, depthWrite: false }));
+        bar.position.set((a.x + b.x) / 2, 0.6, (a.z + b.z) / 2);
+        bar.rotation.y = Math.atan2(b.x - a.x, b.z - a.z);
+        bar.renderOrder = 2;
+        this.congestion.add(bar);
+        this.congestionBars.set(e.id, bar);
+      }
+      const len = Math.hypot(city(e.b).x - city(e.a).x, city(e.b).z - city(e.a).z);
+      bar.scale.set(width, 0.05, len);
+      (bar.material as THREE.MeshBasicMaterial).color.copy(congestionColor(lineLoad(e)));
+    }
   }
 
   /** Yellow overlay along a node path (selected train's route or a selected track). */
@@ -280,4 +337,18 @@ export class TrackView {
     }
     return best;
   }
+}
+
+/** 0 when idle, 1 when saturated: block use, or time trains spend queueing for the line. */
+export function lineLoad(e: TrackEdge): number {
+  return Math.min(1, Math.max(e.util / 0.85, e.held / 30));
+}
+
+const GREEN = new THREE.Color('#2f9e6a');
+const AMBER = new THREE.Color('#f2c12e');
+const RED = new THREE.Color('#d0423f');
+const tmpColor = new THREE.Color();
+
+function congestionColor(load: number): THREE.Color {
+  return load < 0.5 ? tmpColor.copy(GREEN).lerp(AMBER, load / 0.5) : tmpColor.copy(AMBER).lerp(RED, (load - 0.5) / 0.5);
 }
